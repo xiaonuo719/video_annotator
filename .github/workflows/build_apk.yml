@@ -28,6 +28,14 @@ jobs:
         with:
           channel: stable
 
+      - name: Install Android NDKs
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses
+          "$SDKMANAGER" "ndk;28.2.13676358" "ndk;27.0.11902837"
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+
       - name: Get dependencies
         run: flutter pub get
 
