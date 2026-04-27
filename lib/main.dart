@@ -154,10 +154,16 @@ class ProjectService {
   static const _uuid = Uuid();
 
   static Future<String> get _projectDir async {
-    final dir = await getApplicationSupportDirectory();
-    final projectDir = Directory('${dir.path}/projects');
+    // Use app documents directory on external storage for better accessibility
+    final dir = await getApplicationDocumentsDirectory();
+    final projectDir = Directory('${dir.path}/video_annotator_projects');
+
+    debugPrint('Project directory path: ${projectDir.path}');
+
     if (!await projectDir.exists()) {
+      debugPrint('Creating project directory...');
       await projectDir.create(recursive: true);
+      debugPrint('Project directory created.');
     }
     return projectDir.path;
   }
@@ -554,6 +560,7 @@ class AppState extends ChangeNotifier {
 
   Future<void> checkModelStatus() async {
     _isModelDownloaded = await WhisperService.isModelDownloaded(_selectedModelSize);
+    await ensureStoragePermission();
     notifyListeners();
   }
 
@@ -617,6 +624,48 @@ class AppState extends ChangeNotifier {
   Future<bool> requestMicrophonePermission() async {
     final status = await Permission.microphone.request();
     return status.isGranted;
+  }
+
+  Future<bool> requestStoragePermission() async {
+    if (Platform.isAndroid) {
+      // On Android 11+ (API 30+), we need MANAGE_EXTERNAL_STORAGE for full access
+      // or use scoped storage with external storage permissions
+
+      // First check current status
+      final manageStatus = await Permission.manageExternalStorage.status;
+      final storageStatus = await Permission.storage.status;
+
+      if (manageStatus.isGranted || storageStatus.isGranted) {
+        return true;
+      }
+
+      // Request storage permission (works on Android 10 and below)
+      final storageResult = await Permission.storage.request();
+      if (storageResult.isGranted) return true;
+
+      // For Android 11+, we might need MANAGE_EXTERNAL_STORAGE
+      // This requires user to enable it in Settings
+      final manageResult = await Permission.manageExternalStorage.request();
+      return manageResult.isGranted;
+    }
+    return true;
+  }
+
+  Future<void> ensureStoragePermission() async {
+    if (Platform.isAndroid) {
+      // Request both manage external storage and basic storage permissions
+      await [
+        Permission.manageExternalStorage,
+        Permission.storage,
+      ].request();
+
+      // Check if we have at least some access
+      final manageStatus = await Permission.manageExternalStorage.status;
+      final storageStatus = await Permission.storage.status;
+
+      // Log for debugging
+      debugPrint('Storage permission status: manageExternalStorage=$manageStatus, storage=$storageStatus');
+    }
   }
 
   void start() async {
@@ -2057,26 +2106,15 @@ class _ViewerClipItem extends StatelessWidget {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      // Show remark/transcription if available
-                      if (clip.remark != null && clip.remark!.isNotEmpty)
-                        Text(
-                          clip.remark!,
-                          style: const TextStyle(
-                            fontSize: 14,
-                            fontWeight: FontWeight.w500,
-                          ),
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                        )
-                      else
-                        Text(
-                          clip.startTimeStr,
-                          style: const TextStyle(
-                            fontFamily: 'monospace',
-                            fontSize: 16,
-                            fontWeight: FontWeight.w500,
-                          ),
+                      // Show video timeline start time
+                      Text(
+                        clip.startTimeStr,
+                        style: const TextStyle(
+                          fontFamily: 'monospace',
+                          fontSize: 14,
+                          fontWeight: FontWeight.w500,
                         ),
+                      ),
                       const SizedBox(height: 4),
                       Row(
                         children: [
