@@ -749,14 +749,6 @@ packages:
       url: "https://pub.flutter-io.cn"
     source: hosted
     version: "15.1.0"
-  vosk_flutter:
-    dependency: "direct main"
-    description:
-      name: vosk_flutter
-      sha256: "03ad3789891e669f1ee637674ff112b72185a8c8dd3cf7f71fd5e7373ed41c42"
-      url: "https://pub.flutter-io.cn"
-    source: hosted
-    version: "0.3.48"
   wakelock_plus:
     dependency: "direct main"
     description:

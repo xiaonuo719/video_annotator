@@ -648,14 +648,14 @@ class AppState extends ChangeNotifier {
 
     final dir = await getTemporaryDirectory();
     _recordingPath =
-        '${dir.path}/recording_${DateTime.now().millisecondsSinceEpoch}.m4a';
+        '${dir.path}/recording_${DateTime.now().millisecondsSinceEpoch}.wav';
 
     try {
       await _recorder.start(
         const RecordConfig(
-          encoder: AudioEncoder.aacLc,
-          bitRate: 128000,
-          sampleRate: 44100,
+          encoder: AudioEncoder.wav,
+          sampleRate: 16000,
+          numChannels: 1,
         ),
         path: _recordingPath!,
       );
@@ -747,7 +747,7 @@ class AppState extends ChangeNotifier {
         final recordingsDir = await ProjectService.getRecordingsDir(
           _currentProjectPath!,
         );
-        audioPath = '$recordingsDir/$clipId.m4a';
+        audioPath = '$recordingsDir/$clipId.wav';
         await File(path).copy(audioPath);
         // Delete temp file
         await File(path).delete();
