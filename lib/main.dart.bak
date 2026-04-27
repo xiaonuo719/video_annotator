@@ -1,0 +1,1172 @@
+import 'dart:async';
+import 'dart:io';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:provider/provider.dart';
+import 'package:record/record.dart';
+import 'package:share_plus/share_plus.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
+import 'package:whisper_flutter_new/whisper_flutter_new.dart';
+
+void main() {
+  runApp(const VideoAnnotatorApp());
+}
+
+// ==================== Domain ====================
+
+enum TranscribeState { idle, recording, transcribing, done, error }
+
+class ClipSegment {
+  final int startMs;
+  final int endMs;
+  final String type; // "亮点" or "不足"
+  final int index;
+  final String? remark;
+
+  ClipSegment({
+    required this.startMs,
+    required this.endMs,
+    required this.type,
+    required this.index,
+    this.remark,
+  });
+
+  ClipSegment copyWith({String? remark}) {
+    return ClipSegment(
+      startMs: startMs,
+      endMs: endMs,
+      type: type,
+      index: index,
+      remark: remark ?? this.remark,
+    );
+  }
+
+  String toTxtLine() {
+    final remarkPart = remark != null && remark!.isNotEmpty ? ' — $remark' : '';
+    return '${_msToTime(startMs)},${_msToTime(endMs)},$type #$index$remarkPart';
+  }
+
+  String get timeRange => '${_msToTime(startMs)} → ${_msToTime(endMs)}';
+
+  String get durationStr {
+    final sec = (endMs - startMs) ~/ 1000;
+    return '${sec}s';
+  }
+
+  static String _msToTime(int ms) {
+    final totalSeconds = ms ~/ 1000;
+    final h = totalSeconds ~/ 3600;
+    final m = (totalSeconds % 3600) ~/ 60;
+    final s = totalSeconds % 60;
+    return '${h.toString().padLeft(2, '0')}:'
+        '${m.toString().padLeft(2, '0')}:'
+        '${s.toString().padLeft(2, '0')}';
+  }
+}
+
+// ==================== Whisper Service ====================
+
+class WhisperService {
+  static const _model = WhisperModel.base;
+  static const _downloadHost = 'https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main';
+  static const _modelFileName = 'ggml-base.bin';
+  static const _modelSizeLabel = '~140MB';
+
+  static Future<String> get _modelDir async {
+    final dir = await getApplicationSupportDirectory();
+    return dir.path;
+  }
+
+  static Future<bool> isModelDownloaded() async {
+    final dir = await _modelDir;
+    final file = File('$dir/$_modelFileName');
+    return file.existsSync();
+  }
+
+  static Future<void> downloadModel({
+    void Function(double progress)? onProgress,
+  }) async {
+    final dir = await _modelDir;
+    final file = File('$dir/$_modelFileName');
+
+    if (file.existsSync()) return;
+
+    final uri = Uri.parse('$_downloadHost/$_modelFileName');
+    final request = await HttpClient().getUrl(uri);
+    final response = await request.close();
+
+    final contentLength = response.contentLength ?? 0;
+    int received = 0;
+
+    final raf = file.openSync(mode: FileMode.write);
+    await for (var chunk in response) {
+      raf.writeFromSync(chunk);
+      received += chunk.length;
+      if (contentLength > 0 && onProgress != null) {
+        onProgress(received / contentLength);
+      }
+    }
+    await raf.close();
+  }
+
+  static Future<void> deleteModel() async {
+    final dir = await _modelDir;
+    final file = File('$dir/$_modelFileName');
+    if (file.existsSync()) {
+      file.deleteSync();
+    }
+  }
+
+  static Future<String?> transcribe(String audioPath) async {
+    final dir = await _modelDir;
+    final whisper = Whisper(
+      model: _model,
+      modelDir: dir,
+      downloadHost: _downloadHost,
+    );
+
+    try {
+      final result = await whisper.transcribe(
+        transcribeRequest: TranscribeRequest(
+          audio: audioPath,
+          language: 'zh',
+          isNoTimestamps: true,
+        ),
+      );
+      return result.text?.trim();
+    } catch (e) {
+      return null;
+    }
+  }
+}
+
+// ==================== State ====================
+
+class AppState extends ChangeNotifier {
+  bool _isRunning = false;
+  int _elapsedMs = 0;
+  int _highlightCount = 0;
+  int _issueCount = 0;
+  int _windowSeconds = 30;
+  final List<ClipSegment> _clips = [];
+  Timer? _timer;
+
+  // Recording state
+  bool _isRecording = false;
+  int _recordingSecondsLeft = 10;
+  String? _recordingType; // '亮点' or '不足'
+  final AudioRecorder _recorder = AudioRecorder();
+  String? _recordingPath;
+
+  // Model state
+  bool _isModelDownloaded = false;
+  bool _isDownloading = false;
+  double _downloadProgress = 0;
+
+  // Getters
+  bool get isRunning => _isRunning;
+  int get elapsedMs => _elapsedMs;
+  int get windowSeconds => _windowSeconds;
+  List<ClipSegment> get clips => List.unmodifiable(_clips);
+  bool get isRecording => _isRecording;
+  int get recordingSecondsLeft => _recordingSecondsLeft;
+  String? get recordingType => _recordingType;
+  bool get isModelDownloaded => _isModelDownloaded;
+  bool get isDownloading => _isDownloading;
+  double get downloadProgress => _downloadProgress;
+
+  String get formattedTime {
+    final totalSeconds = _elapsedMs ~/ 1000;
+    final h = totalSeconds ~/ 3600;
+    final m = (totalSeconds % 3600) ~/ 60;
+    final s = totalSeconds % 60;
+    return '${h.toString().padLeft(2, '0')}:'
+        '${m.toString().padLeft(2, '0')}:'
+        '${s.toString().padLeft(2, '0')}';
+  }
+
+  Future<void> checkModelStatus() async {
+    _isModelDownloaded = await WhisperService.isModelDownloaded();
+    notifyListeners();
+  }
+
+  Future<void> downloadModel() async {
+    if (_isDownloading || _isModelDownloaded) return;
+    _isDownloading = true;
+    _downloadProgress = 0;
+    notifyListeners();
+
+    try {
+      await WhisperService.downloadModel(
+        onProgress: (p) {
+          _downloadProgress = p;
+          notifyListeners();
+        },
+      );
+      _isModelDownloaded = true;
+    } catch (e) {
+      // Download failed silently
+    } finally {
+      _isDownloading = false;
+      notifyListeners();
+    }
+  }
+
+  Future<void> deleteModel() async {
+    await WhisperService.deleteModel();
+    _isModelDownloaded = false;
+    notifyListeners();
+  }
+
+  void setWindowSeconds(int seconds) {
+    _windowSeconds = seconds.clamp(5, 120);
+    notifyListeners();
+  }
+
+  void start() async {
+    if (_isRunning) return;
+    _isRunning = true;
+    WakelockPlus.enable();
+    _timer = Timer.periodic(const Duration(milliseconds: 100), (_) {
+      _elapsedMs += 100;
+      notifyListeners();
+    });
+    notifyListeners();
+  }
+
+  void stop() async {
+    if (!_isRunning) return;
+    _isRunning = false;
+    WakelockPlus.disable();
+    _timer?.cancel();
+    _timer = null;
+    notifyListeners();
+  }
+
+  void toggle() {
+    if (_isRunning) {
+      stop();
+    } else {
+      start();
+    }
+  }
+
+  void onMarkButtonPressed(String type) async {
+    if (_isRecording) return;
+
+    // Check if model is downloaded
+    if (!_isModelDownloaded) {
+      return; // The UI should show a toast telling user to download model first
+    }
+
+    // Start 10-second recording
+    _recordingType = type;
+    _recordingSecondsLeft = 10;
+    _isRecording = true;
+    notifyListeners();
+
+    // Start audio recording
+    final dir = await getTemporaryDirectory();
+    _recordingPath = '${dir.path}/recording_${DateTime.now().millisecondsSinceEpoch}.m4a';
+
+    await _recorder.start(
+      const RecordConfig(
+        encoder: AudioEncoder.aacLc,
+        bitRate: 128000,
+        sampleRate: 44100,
+      ),
+      path: _recordingPath!,
+    );
+
+    // Countdown timer
+    Timer.periodic(const Duration(seconds: 1), (t) {
+      _recordingSecondsLeft--;
+      notifyListeners();
+      if (_recordingSecondsLeft <= 0) {
+        t.cancel();
+        _stopRecordingAndTranscribe();
+      }
+    });
+  }
+
+  void cancelRecording() {
+    if (!_isRecording) return;
+    _recorder.cancel();
+    _isRecording = false;
+    _recordingType = null;
+    _recordingSecondsLeft = 10;
+    notifyListeners();
+  }
+
+  void _stopRecordingAndTranscribe() async {
+    if (!_isRecording || _recordingPath == null) return;
+
+    final path = _recordingPath!;
+    final type = _recordingType!;
+    final elapsed = _elapsedMs;
+
+    _isRecording = false;
+    _recordingType = null;
+    _recordingSecondsLeft = 10;
+    notifyListeners();
+
+    await _recorder.stop();
+
+    // Create clip immediately with start/end time
+    final start = (elapsed - _windowSeconds * 1000).clamp(0, elapsed);
+    final end = elapsed + _windowSeconds * 1000;
+
+    if (type == '亮点') {
+      _highlightCount++;
+    } else {
+      _issueCount++;
+    }
+
+    final clip = ClipSegment(
+      startMs: start,
+      endMs: end,
+      type: type,
+      index: type == '亮点' ? _highlightCount : _issueCount,
+    );
+    _clips.add(clip);
+    notifyListeners();
+
+    // Transcribe in background
+    final remark = await WhisperService.transcribe(path);
+
+    // Update clip with remark
+    final idx = _clips.indexWhere((c) => c == clip);
+    if (idx != -1) {
+      _clips[idx] = clip.copyWith(remark: remark);
+      notifyListeners();
+    }
+
+    // Clean up recording file
+    try {
+      File(path).deleteSync();
+    } catch (_) {}
+  }
+
+  void removeClip(ClipSegment clip) {
+    _clips.remove(clip);
+    notifyListeners();
+  }
+
+  void reset() {
+    stop();
+    _elapsedMs = 0;
+    _highlightCount = 0;
+    _issueCount = 0;
+    _clips.clear();
+    notifyListeners();
+  }
+
+  String generateTxt() {
+    final sorted = List<ClipSegment>.from(_clips)
+      ..sort((a, b) => a.startMs.compareTo(b.startMs));
+    return sorted.map((c) => c.toTxtLine()).join('\n');
+  }
+
+  @override
+  void dispose() {
+    WakelockPlus.disable();
+    _timer?.cancel();
+    _recorder.dispose();
+    super.dispose();
+  }
+}
+
+// ==================== App ====================
+
+class VideoAnnotatorApp extends StatelessWidget {
+  const VideoAnnotatorApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return ChangeNotifierProvider(
+      create: (_) => AppState()..checkModelStatus(),
+      child: MaterialApp(
+        title: '视频标注工具',
+        debugShowCheckedModeBanner: false,
+        theme: ThemeData(
+          colorScheme: ColorScheme.fromSeed(
+            seedColor: const Color(0xFF1976D2),
+            brightness: Brightness.light,
+          ),
+          useMaterial3: true,
+        ),
+        darkTheme: ThemeData(
+          colorScheme: ColorScheme.fromSeed(
+            seedColor: const Color(0xFF1976D2),
+            brightness: Brightness.dark,
+          ),
+          useMaterial3: true,
+        ),
+        themeMode: ThemeMode.system,
+        home: const MainScreen(),
+      ),
+    );
+  }
+}
+
+// ==================== UI ====================
+
+class MainScreen extends StatelessWidget {
+  const MainScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppState>();
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('视频标注工具'),
+        centerTitle: true,
+        elevation: 0,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.tune),
+            tooltip: '设置',
+            onPressed: () => showModalBottomSheet(
+              context: context,
+              isScrollControlled: true,
+              builder: (_) => const _SettingsSheet(),
+            ),
+          ),
+        ],
+      ),
+      body: SafeArea(
+        child: Column(
+          children: [
+            Expanded(flex: 2, child: _TimerSection()),
+            const Divider(height: 1),
+            Expanded(flex: 3, child: _ClipListSection()),
+            _BottomActionsSection(),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ==================== Settings Sheet ====================
+
+class _SettingsSheet extends StatelessWidget {
+  const _SettingsSheet();
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppState>();
+    final theme = Theme.of(context);
+
+    return Container(
+      padding: const EdgeInsets.all(24),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text('设置', style: theme.textTheme.titleLarge),
+              IconButton(
+                onPressed: () => Navigator.pop(context),
+                icon: const Icon(Icons.close),
+              ),
+            ],
+          ),
+          const SizedBox(height: 20),
+
+          // Model download section
+          Text('语音转文字模型', style: theme.textTheme.titleSmall?.copyWith(
+            color: theme.colorScheme.primary,
+          )),
+          const SizedBox(height: 8),
+          Text(
+            'Whisper Base 模型（约 140MB）',
+            style: theme.textTheme.bodySmall,
+          ),
+          const SizedBox(height: 8),
+
+          if (state.isModelDownloaded) ...[
+            Row(
+              children: [
+                const Icon(Icons.check_circle, color: Colors.green, size: 20),
+                const SizedBox(width: 8),
+                const Expanded(child: Text('已下载', style: TextStyle(color: Colors.green))),
+                TextButton(
+                  onPressed: () async {
+                    await state.deleteModel();
+                  },
+                  child: const Text('删除', style: TextStyle(color: Colors.red)),
+                ),
+              ],
+            ),
+          ] else if (state.isDownloading) ...[
+            Row(
+              children: [
+                Expanded(
+                  child: LinearProgressIndicator(
+                    value: state.downloadProgress,
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Text('${(state.downloadProgress * 100).toInt()}%',
+                    style: theme.textTheme.bodySmall),
+              ],
+            ),
+          ] else ...[
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                onPressed: () => state.downloadModel(),
+                icon: const Icon(Icons.download),
+                label: const Text('下载模型'),
+              ),
+            ),
+          ],
+
+          const SizedBox(height: 24),
+          const Divider(),
+          const SizedBox(height: 16),
+
+          // Time window section
+          Text('时间窗口', style: theme.textTheme.titleSmall?.copyWith(
+            color: theme.colorScheme.primary,
+          )),
+          const SizedBox(height: 8),
+          StatefulBuilder(
+            builder: (ctx, setState) {
+              int temp = state.windowSeconds;
+              return Column(
+                children: [
+                  Text(
+                    '前后 ${temp} 秒（共 ${temp * 2} 秒）',
+                    style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                  Slider(
+                    value: temp.toDouble(),
+                    min: 5,
+                    max: 120,
+                    divisions: 23,
+                    label: '${temp}s',
+                    onChanged: (v) {
+                      setState(() => temp = v.round());
+                      state.setWindowSeconds(temp);
+                    },
+                  ),
+                ],
+              );
+            },
+          ),
+          const SizedBox(height: 16),
+        ],
+      ),
+    );
+  }
+}
+
+// ==================== Timer Section ====================
+
+class _TimerSection extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppState>();
+    final theme = Theme.of(context);
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 20),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Text(
+            state.formattedTime,
+            style: TextStyle(
+              fontSize: 88,
+              fontWeight: FontWeight.w200,
+              fontFamily: 'monospace',
+              letterSpacing: 4,
+              color: state.isRunning
+                  ? theme.colorScheme.primary
+                  : theme.colorScheme.onSurface.withAlpha(180),
+            ),
+          ),
+          Text(
+            '已标记 ${state.clips.length} 个片段 · ±${state.windowSeconds}s',
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(height: 16),
+          _SlideToToggle(),
+          const SizedBox(height: 20),
+          if (state.isRunning)
+            _MarkButtons()
+          else
+            Text(
+              '滑动上方按钮开始计时',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+// ==================== Slide to Toggle ====================
+
+class _SlideToToggle extends StatefulWidget {
+  @override
+  State<_SlideToToggle> createState() => _SlideToToggleState();
+}
+
+class _SlideToToggleState extends State<_SlideToToggle> {
+  double _dragPosition = 0;
+  bool _armed = false;
+
+  void _onDragUpdate(DragUpdateDetails details, double maxWidth) {
+    setState(() {
+      _dragPosition = (_dragPosition + details.delta.dx).clamp(0, maxWidth);
+    });
+  }
+
+  void _onDragEnd(DragEndDetails details, double maxWidth) {
+    final state = context.read<AppState>();
+    if (_dragPosition >= maxWidth * 0.85) {
+      state.toggle();
+    }
+    setState(() {
+      _dragPosition = 0;
+      _armed = false;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppState>();
+    final theme = Theme.of(context);
+    final color = state.isRunning
+        ? const Color(0xFFD32F2F)
+        : theme.colorScheme.primary;
+    final thumbIcon = state.isRunning ? Icons.stop : Icons.play_arrow;
+
+    return Column(
+      children: [
+        Text(
+          _armed
+              ? '松开取消'
+              : (state.isRunning ? '滑到这里停止' : '滑到这里开始'),
+          style: TextStyle(
+            fontSize: 13,
+            color: _armed ? color : theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+        const SizedBox(height: 6),
+        LayoutBuilder(
+          builder: (ctx, constraints) {
+            final maxWidth = constraints.maxWidth;
+            return GestureDetector(
+              onHorizontalDragStart: (_) => setState(() => _armed = true),
+              onHorizontalDragUpdate: (d) => _onDragUpdate(d, maxWidth),
+              onHorizontalDragEnd: (d) => _onDragEnd(d, maxWidth),
+              child: Container(
+                height: 56,
+                width: maxWidth,
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(28),
+                  color: color.withAlpha(38),
+                  border: Border.all(
+                    color: color.withAlpha(_armed ? 255 : 128),
+                    width: 2,
+                  ),
+                ),
+                child: Stack(
+                  children: [
+                    AnimatedContainer(
+                      duration: const Duration(milliseconds: 50),
+                      width: _dragPosition + 56,
+                      height: 56,
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(28),
+                        color: color.withAlpha(77),
+                      ),
+                    ),
+                    Center(
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(thumbIcon,
+                              color: _armed ? color : theme.colorScheme.onSurfaceVariant,
+                              size: 22),
+                          const SizedBox(width: 6),
+                          Text(
+                            state.isRunning ? '滑动停止' : '滑动开始',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              color: _armed ? color : theme.colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                          const SizedBox(width: 4),
+                          Icon(Icons.chevron_right,
+                              color: _armed
+                                  ? color
+                                  : theme.colorScheme.onSurfaceVariant.withAlpha(150),
+                              size: 20),
+                          Icon(Icons.chevron_right,
+                              color: _armed
+                                  ? color
+                                  : theme.colorScheme.onSurfaceVariant.withAlpha(77),
+                              size: 20),
+                        ],
+                      ),
+                    ),
+                    Positioned(
+                      left: _dragPosition,
+                      top: 0,
+                      child: Container(
+                        width: 56,
+                        height: 56,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: color,
+                          boxShadow: [
+                            BoxShadow(
+                                color: color.withAlpha(102),
+                                blurRadius: 8,
+                                spreadRadius: 1),
+                          ],
+                        ),
+                        child: Icon(thumbIcon, color: Colors.white, size: 28),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        ),
+      ],
+    );
+  }
+}
+
+// ==================== Mark Buttons ====================
+
+class _MarkButtons extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppState>();
+
+    return Row(
+      children: [
+        Expanded(
+          child: _MarkButton(
+            type: '亮点',
+            label: '⭐ 亮点',
+            color: const Color(0xFFFFA000),
+            textColor: Colors.black,
+            count: state.clips.where((c) => c.type == '亮点').length,
+            isRecording: state.isRecording && state.recordingType == '亮点',
+            recordingSecondsLeft: state.recordingSecondsLeft,
+            isTranscribing: state.isRecording && state.recordingType == '亮点',
+            onTap: () {
+              if (!state.isModelDownloaded) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('请先在设置中下载语音模型'),
+                    duration: Duration(seconds: 2),
+                  ),
+                );
+                return;
+              }
+              if (!state.isRecording) {
+                state.onMarkButtonPressed('亮点');
+              }
+            },
+            onCancel: () => state.cancelRecording(),
+          ),
+        ),
+        const SizedBox(width: 16),
+        Expanded(
+          child: _MarkButton(
+            type: '不足',
+            label: '⚠ 不足',
+            color: const Color(0xFFD32F2F),
+            textColor: Colors.white,
+            count: state.clips.where((c) => c.type == '不足').length,
+            isRecording: state.isRecording && state.recordingType == '不足',
+            recordingSecondsLeft: state.recordingSecondsLeft,
+            isTranscribing: state.isRecording && state.recordingType == '不足',
+            onTap: () {
+              if (!state.isModelDownloaded) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('请先在设置中下载语音模型'),
+                    duration: Duration(seconds: 2),
+                  ),
+                );
+                return;
+              }
+              if (!state.isRecording) {
+                state.onMarkButtonPressed('不足');
+              }
+            },
+            onCancel: () => state.cancelRecording(),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _MarkButton extends StatefulWidget {
+  final String type;
+  final String label;
+  final Color color;
+  final Color textColor;
+  final int count;
+  final bool isRecording;
+  final int recordingSecondsLeft;
+  final bool isTranscribing;
+  final VoidCallback onTap;
+  final VoidCallback onCancel;
+
+  const _MarkButton({
+    required this.type,
+    required this.label,
+    required this.color,
+    required this.textColor,
+    required this.count,
+    required this.isRecording,
+    required this.recordingSecondsLeft,
+    required this.isTranscribing,
+    required this.onTap,
+    required this.onCancel,
+  });
+
+  @override
+  State<_MarkButton> createState() => _MarkButtonState();
+}
+
+class _MarkButtonState extends State<_MarkButton> {
+  bool _flash = false;
+
+  void _triggerFlash() {
+    setState(() => _flash = true);
+    Future.delayed(const Duration(milliseconds: 400), () {
+      if (mounted) setState(() => _flash = false);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isThisRecording = widget.isRecording;
+
+    return GestureDetector(
+      onTap: () {
+        if (isThisRecording) {
+          widget.onCancel();
+        } else {
+          _triggerFlash();
+          widget.onTap();
+        }
+      },
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        height: 64,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(16),
+          color: isThisRecording
+              ? widget.color.withAlpha(77)
+              : _flash
+                  ? widget.color
+                  : widget.color.withAlpha(200),
+          boxShadow: [
+            BoxShadow(
+              color: widget.color.withAlpha(_flash ? 150 : 77),
+              blurRadius: _flash ? 16 : 8,
+              spreadRadius: _flash ? 2 : 0,
+            ),
+          ],
+        ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            if (isThisRecording) ...[
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      value: widget.recordingSecondsLeft / 10,
+                      color: widget.textColor,
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    '${widget.recordingSecondsLeft}s',
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                      color: widget.textColor,
+                    ),
+                  ),
+                ],
+              ),
+              Text(
+                '点击取消',
+                style: TextStyle(
+                  fontSize: 11,
+                  color: widget.textColor.withAlpha(180),
+                ),
+              ),
+            ] else ...[
+              Text(
+                widget.label,
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                  color: widget.textColor,
+                ),
+              ),
+              if (widget.count > 0)
+                Text(
+                  '${widget.count}个',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: widget.textColor.withAlpha(180),
+                  ),
+                ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ==================== Clip List ====================
+
+class _ClipListSection extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppState>();
+    final theme = Theme.of(context);
+
+    if (state.clips.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              Icons.bookmark_border,
+              size: 48,
+              color: theme.colorScheme.onSurfaceVariant.withAlpha(100),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              '还没有标记任何片段',
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+            Text(
+              '滑动上方按钮开始标注',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant.withAlpha(150),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return ListView.builder(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+      itemCount: state.clips.length,
+      itemBuilder: (ctx, i) {
+        final clip = state.clips[i];
+        return _ClipItem(
+          clip: clip,
+          onDelete: () => state.removeClip(clip),
+        );
+      },
+    );
+  }
+}
+
+class _ClipItem extends StatelessWidget {
+  final ClipSegment clip;
+  final VoidCallback onDelete;
+
+  const _ClipItem({required this.clip, required this.onDelete});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isHighlight = clip.type == '亮点';
+    final bgColor = isHighlight
+        ? const Color(0xFFFFE082).withAlpha(51)
+        : const Color(0xFFEF9A9A).withAlpha(51);
+    final labelColor =
+        isHighlight ? const Color(0xFFFF8F00) : const Color(0xFFD32F2F);
+
+    return Card(
+      color: bgColor,
+      margin: const EdgeInsets.symmetric(vertical: 3),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      elevation: 0,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        child: Row(
+          children: [
+            Container(
+              width: 4,
+              height: 36,
+              decoration: BoxDecoration(
+                color: labelColor,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    clip.timeRange,
+                    style: const TextStyle(
+                      fontFamily: 'monospace',
+                      fontSize: 14,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Row(
+                    children: [
+                      Text(
+                        '${clip.type} #${clip.index}',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                          color: labelColor,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                        decoration: BoxDecoration(
+                          color: labelColor.withAlpha(26),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text(
+                          clip.durationStr,
+                          style: TextStyle(fontSize: 11, color: labelColor),
+                        ),
+                      ),
+                      if (clip.remark != null && clip.remark!.isNotEmpty) ...[
+                        const SizedBox(width: 8),
+                        Icon(
+                          Icons.comment,
+                          size: 14,
+                          color: theme.colorScheme.primary,
+                        ),
+                      ],
+                    ],
+                  ),
+                  if (clip.remark != null && clip.remark!.isNotEmpty) ...[
+                    const SizedBox(height: 4),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: theme.colorScheme.primary.withAlpha(13),
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Text(
+                        clip.remark!,
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: theme.colorScheme.primary,
+                          fontStyle: FontStyle.italic,
+                        ),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            IconButton(
+              onPressed: onDelete,
+              icon: const Icon(Icons.delete_outline, size: 20),
+              visualDensity: VisualDensity.compact,
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ==================== Bottom Actions ====================
+
+class _BottomActionsSection extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppState>();
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+      child: Row(
+        children: [
+          Expanded(
+            child: OutlinedButton.icon(
+              onPressed: state.clips.isEmpty ? null : state.reset,
+              icon: const Icon(Icons.refresh),
+              label: const Text('重置'),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: FilledButton.icon(
+              onPressed: state.clips.isEmpty ? null : () => _shareTxt(context, state),
+              icon: const Icon(Icons.share),
+              label: const Text('导出 TXT'),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _shareTxt(BuildContext context, AppState state) async {
+    final content = state.generateTxt();
+    try {
+      final dir = await getTemporaryDirectory();
+      final fileName =
+          'video_clips_${DateTime.now().millisecondsSinceEpoch}.txt';
+      final file = File('${dir.path}/$fileName');
+      await file.writeAsString(content);
+
+      await Share.shareXFiles(
+        [XFile(file.path)],
+        subject: '视频标注片段',
+      );
+    } catch (e) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('导出失败: $e')),
+        );
+      }
+    }
+  }
+}
