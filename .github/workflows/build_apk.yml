@@ -28,15 +28,29 @@ jobs:
         with:
           channel: stable
 
+      - name: Install Android NDKs
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [ -z "$SDK_ROOT" ]; then
+            echo "ANDROID_SDK_ROOT/ANDROID_HOME is not set" >&2
+            exit 1
+          fi
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            echo "sdkmanager not found at $SDKMANAGER" >&2
+            exit 1
+          fi
+          set +o pipefail
+          yes 2>/dev/null | "$SDKMANAGER" --licenses
+          set -o pipefail
+          "$SDKMANAGER" "ndk;28.2.13676358" "ndk;27.0.11902837"
+
       - name: Get dependencies
         run: flutter pub get
-        env:
-          PUB_HOSTED_URL: https://pub.dartlang.org
 
       - name: Build APK (debug)
         run: flutter build apk --debug
-        env:
-          ANDROID_HOME: /usr/local/lib/android/sdk
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
@@ -47,8 +61,6 @@ jobs:
 
       - name: Build APK (release)
         run: flutter build apk --release
-        env:
-          ANDROID_HOME: /usr/local/lib/android/sdk
 
       - name: Upload Release APK artifact
         uses: actions/upload-artifact@v4
