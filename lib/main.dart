@@ -154,9 +154,27 @@ class ProjectService {
   static const _uuid = Uuid();
 
   static Future<String> get _projectDir async {
-    // Use app documents directory on external storage for better accessibility
-    final dir = await getApplicationDocumentsDirectory();
-    final projectDir = Directory('${dir.path}/video_annotator_projects');
+    Directory? baseDir;
+
+    if (Platform.isAndroid) {
+      // Prefer external storage so data is visible in file managers and
+      // survives app updates. On Android 4.4+ no runtime permission is
+      // required to access the app-specific external directory.
+      try {
+        final extDir = await getExternalStorageDirectory();
+        if (extDir != null) {
+          baseDir = extDir;
+        }
+      } catch (e) {
+        debugPrint('Failed to get external storage directory: $e');
+      }
+    }
+
+    // Fall back to internal app documents directory when external storage is
+    // unavailable (e.g. removable media not mounted) or on non-Android platforms.
+    baseDir ??= await getApplicationDocumentsDirectory();
+
+    final projectDir = Directory('${baseDir.path}/video_annotator_projects');
 
     debugPrint('Project directory path: ${projectDir.path}');
 
@@ -627,45 +645,45 @@ class AppState extends ChangeNotifier {
   }
 
   Future<bool> requestStoragePermission() async {
-    if (Platform.isAndroid) {
-      // On Android 11+ (API 30+), we need MANAGE_EXTERNAL_STORAGE for full access
-      // or use scoped storage with external storage permissions
+    if (!Platform.isAndroid) return true;
 
-      // First check current status
-      final manageStatus = await Permission.manageExternalStorage.status;
-      final storageStatus = await Permission.storage.status;
+    // App-specific external storage (getExternalStorageDirectory) does not
+    // require any runtime permission on Android 4.4+ (API 19+).
+    // However, MANAGE_EXTERNAL_STORAGE is declared in the manifest for
+    // Android 11+ devices where broader access may be needed. Request it
+    // so the user is prompted once.
+    final manageStatus = await Permission.manageExternalStorage.status;
+    if (manageStatus.isGranted) return true;
 
-      if (manageStatus.isGranted || storageStatus.isGranted) {
-        return true;
-      }
+    // On Android ≤ 12 (API 32), the legacy WRITE_EXTERNAL_STORAGE is still
+    // useful for accessing shared storage. permission_handler v12 returns
+    // `granted` automatically on Android 13+ where this permission no longer
+    // exists.
+    final storageStatus = await Permission.storage.status;
+    if (storageStatus.isGranted) return true;
 
-      // Request storage permission (works on Android 10 and below)
-      final storageResult = await Permission.storage.request();
-      if (storageResult.isGranted) return true;
+    // Request legacy storage first (shows a normal dialog on Android ≤ 12).
+    final storageResult = await Permission.storage.request();
+    if (storageResult.isGranted) return true;
 
-      // For Android 11+, we might need MANAGE_EXTERNAL_STORAGE
-      // This requires user to enable it in Settings
-      final manageResult = await Permission.manageExternalStorage.request();
-      return manageResult.isGranted;
-    }
-    return true;
+    // Request MANAGE_EXTERNAL_STORAGE – on Android 11+ this opens the
+    // system Settings screen; the user must toggle the switch there.
+    final manageResult = await Permission.manageExternalStorage.request();
+    return manageResult.isGranted;
   }
 
   Future<void> ensureStoragePermission() async {
-    if (Platform.isAndroid) {
-      // Request both manage external storage and basic storage permissions
-      await [
-        Permission.manageExternalStorage,
-        Permission.storage,
-      ].request();
+    if (!Platform.isAndroid) return;
 
-      // Check if we have at least some access
-      final manageStatus = await Permission.manageExternalStorage.status;
-      final storageStatus = await Permission.storage.status;
+    // Request permissions sequentially so the user sees one dialog at a time.
+    await requestStoragePermission();
 
-      // Log for debugging
-      debugPrint('Storage permission status: manageExternalStorage=$manageStatus, storage=$storageStatus');
-    }
+    final manageStatus = await Permission.manageExternalStorage.status;
+    final storageStatus = await Permission.storage.status;
+
+    debugPrint(
+      'Storage permission status: manageExternalStorage=$manageStatus, storage=$storageStatus',
+    );
   }
 
   void start() async {
