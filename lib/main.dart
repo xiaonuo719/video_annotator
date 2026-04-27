@@ -20,7 +20,7 @@ class ClipSegment {
   final String id;
   final int startMs;
   final int endMs;
-  final String type; // "亮点" or "不足"
+  final String type; // "接管" or "亮点" or "不足"
   final int index;
   final String? remark;
   final DateTime wallClockTime;
@@ -319,7 +319,7 @@ class AppState extends ChangeNotifier {
   // Recording state
   bool _isRecording = false;
   int _recordingSecondsLeft = 10;
-  String? _recordingType; // '亮点' or '不足'
+  String? _recordingType; // '接管' or '亮点' or '不足'
   final AudioRecorder _recorder = AudioRecorder();
   String? _recordingPath;
   String? _recordingId;
@@ -522,7 +522,7 @@ class AppState extends ChangeNotifier {
 
     if (type == '亮点') {
       _highlightCount++;
-    } else {
+    } else if (type == '不足') {
       _issueCount++;
     }
 
@@ -796,6 +796,7 @@ class _HomePage extends StatelessWidget {
         centerTitle: true,
         elevation: 0,
         automaticallyImplyLeading: false,
+        actions: [_ToggleButton(), const SizedBox(width: 8)],
       ),
       body: SafeArea(
         child: Column(
@@ -1259,171 +1260,152 @@ class _TimerSection extends StatelessWidget {
                   : theme.colorScheme.onSurface.withAlpha(180),
             ),
           ),
+          const SizedBox(height: 8),
           Text(
             '已标记 ${state.clips.length} 个片段 · ±${state.windowSeconds}s',
             style: theme.textTheme.bodyMedium?.copyWith(
               color: theme.colorScheme.onSurfaceVariant,
             ),
           ),
-          const SizedBox(height: 16),
-          _ClickToggleButton(),
-          const SizedBox(height: 20),
-          if (state.isRunning)
-            _MarkButtons()
-          else
-            Text(
-              '点击按钮开始计时',
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
-              ),
-            ),
+          const SizedBox(height: 24),
+          _MarkButtonsColumn(),
         ],
       ),
     );
   }
 }
 
-// ==================== Toggle Button ====================
+// ==================== Toggle Button (AppBar) ====================
 
-class _ClickToggleButton extends StatelessWidget {
+class _ToggleButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
-    final theme = Theme.of(context);
     final isRunning = state.isRunning;
-    final color = isRunning
-        ? const Color(0xFFD32F2F)
-        : theme.colorScheme.primary;
-    final thumbIcon = isRunning ? Icons.stop : Icons.play_arrow;
-    final label = isRunning ? '点击停止' : '点击开始';
+    final color = isRunning ? const Color(0xFFD32F2F) : Colors.green;
+    final icon = isRunning ? Icons.stop : Icons.play_arrow;
 
-    return SizedBox(
-      width: 200,
-      height: 56,
-      child: ElevatedButton.icon(
-        onPressed: () => state.toggle(),
-        icon: Icon(thumbIcon, size: 26),
-        label: Text(
-          label,
-          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-        ),
-        style: ElevatedButton.styleFrom(
-          backgroundColor: color,
-          foregroundColor: Colors.white,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(28),
-          ),
-          elevation: 4,
-        ),
-      ),
+    return IconButton(
+      onPressed: () => state.toggle(),
+      icon: Icon(icon, color: color),
+      tooltip: isRunning ? '停止' : '开始',
+      style: IconButton.styleFrom(backgroundColor: color.withAlpha(26)),
     );
   }
 }
 
-// ==================== Mark Buttons ====================
+// ==================== Mark Buttons Column ====================
 
-class _MarkButtons extends StatelessWidget {
+class _MarkButtonsColumn extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
 
-    return Row(
+    return Column(
+      mainAxisSize: MainAxisSize.min,
       children: [
-        Expanded(
-          child: _MarkButton(
-            type: '亮点',
-            label: '⭐ 亮点',
-            color: const Color(0xFFFFA000),
-            textColor: Colors.black,
-            count: state.clips.where((c) => c.type == '亮点').length,
-            isRecording: state.isRecording && state.recordingType == '亮点',
-            recordingSecondsLeft: state.recordingSecondsLeft,
-            isTranscribing: state.isRecording && state.recordingType == '亮点',
-            onTap: () {
-              if (!state.isModelDownloaded) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('请先在设置中下载语音模型'),
-                    duration: Duration(seconds: 2),
-                  ),
-                );
-                return;
-              }
-              if (!state.isRecording) {
-                state.onMarkButtonPressed('亮点');
-              }
-            },
-            onCancel: () => state.cancelRecording(),
-          ),
+        _LargeMarkButton(
+          type: '接管',
+          color: const Color(0xFF1976D2),
+          textColor: Colors.white,
+          isRecording: state.isRecording && state.recordingType == '接管',
+          recordingSecondsLeft: state.recordingSecondsLeft,
+          onTap: () {
+            if (!state.isModelDownloaded) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text('请先在设置中下载语音模型'),
+                  duration: Duration(seconds: 2),
+                ),
+              );
+              return;
+            }
+            if (!state.isRecording) {
+              state.onMarkButtonPressed('接管');
+            }
+          },
+          onCancel: () => state.cancelRecording(),
         ),
-        const SizedBox(width: 16),
-        Expanded(
-          child: _MarkButton(
-            type: '不足',
-            label: '⚠ 不足',
-            color: const Color(0xFFD32F2F),
-            textColor: Colors.white,
-            count: state.clips.where((c) => c.type == '不足').length,
-            isRecording: state.isRecording && state.recordingType == '不足',
-            recordingSecondsLeft: state.recordingSecondsLeft,
-            isTranscribing: state.isRecording && state.recordingType == '不足',
-            onTap: () {
-              if (!state.isModelDownloaded) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('请先在设置中下载语音模型'),
-                    duration: Duration(seconds: 2),
-                  ),
-                );
-                return;
-              }
-              if (!state.isRecording) {
-                state.onMarkButtonPressed('不足');
-              }
-            },
-            onCancel: () => state.cancelRecording(),
-          ),
+        const SizedBox(height: 16),
+        _LargeMarkButton(
+          type: '亮点',
+          color: const Color(0xFFFFA000),
+          textColor: Colors.black,
+          isRecording: state.isRecording && state.recordingType == '亮点',
+          recordingSecondsLeft: state.recordingSecondsLeft,
+          onTap: () {
+            if (!state.isModelDownloaded) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text('请先在设置中下载语音模型'),
+                  duration: Duration(seconds: 2),
+                ),
+              );
+              return;
+            }
+            if (!state.isRecording) {
+              state.onMarkButtonPressed('亮点');
+            }
+          },
+          onCancel: () => state.cancelRecording(),
+        ),
+        const SizedBox(height: 16),
+        _LargeMarkButton(
+          type: '不足',
+          color: const Color(0xFFD32F2F),
+          textColor: Colors.white,
+          isRecording: state.isRecording && state.recordingType == '不足',
+          recordingSecondsLeft: state.recordingSecondsLeft,
+          onTap: () {
+            if (!state.isModelDownloaded) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text('请先在设置中下载语音模型'),
+                  duration: Duration(seconds: 2),
+                ),
+              );
+              return;
+            }
+            if (!state.isRecording) {
+              state.onMarkButtonPressed('不足');
+            }
+          },
+          onCancel: () => state.cancelRecording(),
         ),
       ],
     );
   }
 }
 
-class _MarkButton extends StatefulWidget {
+class _LargeMarkButton extends StatefulWidget {
   final String type;
-  final String label;
   final Color color;
   final Color textColor;
-  final int count;
   final bool isRecording;
   final int recordingSecondsLeft;
-  final bool isTranscribing;
   final VoidCallback onTap;
   final VoidCallback onCancel;
 
-  const _MarkButton({
+  const _LargeMarkButton({
     required this.type,
-    required this.label,
     required this.color,
     required this.textColor,
-    required this.count,
     required this.isRecording,
     required this.recordingSecondsLeft,
-    required this.isTranscribing,
     required this.onTap,
     required this.onCancel,
   });
 
   @override
-  State<_MarkButton> createState() => _MarkButtonState();
+  State<_LargeMarkButton> createState() => _LargeMarkButtonState();
 }
 
-class _MarkButtonState extends State<_MarkButton> {
+class _LargeMarkButtonState extends State<_LargeMarkButton> {
   bool _flash = false;
 
   void _triggerFlash() {
     setState(() => _flash = true);
-    Future.delayed(const Duration(milliseconds: 400), () {
+    Future.delayed(const Duration(milliseconds: 200), () {
       if (mounted) setState(() => _flash = false);
     });
   }
@@ -1442,10 +1424,11 @@ class _MarkButtonState extends State<_MarkButton> {
         }
       },
       child: AnimatedContainer(
-        duration: const Duration(milliseconds: 200),
-        height: 64,
+        duration: const Duration(milliseconds: 150),
+        width: double.infinity,
+        height: 80,
         decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(16),
+          borderRadius: BorderRadius.circular(20),
           color: isThisRecording
               ? widget.color.withAlpha(77)
               : _flash
@@ -1454,64 +1437,44 @@ class _MarkButtonState extends State<_MarkButton> {
           boxShadow: [
             BoxShadow(
               color: widget.color.withAlpha(_flash ? 150 : 77),
-              blurRadius: _flash ? 16 : 8,
+              blurRadius: _flash ? 20 : 10,
               spreadRadius: _flash ? 2 : 0,
             ),
           ],
         ),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            if (isThisRecording) ...[
-              Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  SizedBox(
-                    width: 14,
-                    height: 14,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      value: widget.recordingSecondsLeft / 10,
-                      color: widget.textColor,
+        child: Center(
+          child: isThisRecording
+              ? Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        value: widget.recordingSecondsLeft / 10,
+                        color: widget.textColor,
+                      ),
                     ),
-                  ),
-                  const SizedBox(width: 6),
-                  Text(
-                    '${widget.recordingSecondsLeft}s',
-                    style: TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                      color: widget.textColor,
+                    const SizedBox(width: 12),
+                    Text(
+                      '${widget.recordingSecondsLeft}s - 点击取消',
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                        color: widget.textColor,
+                      ),
                     ),
-                  ),
-                ],
-              ),
-              Text(
-                '点击取消',
-                style: TextStyle(
-                  fontSize: 11,
-                  color: widget.textColor.withAlpha(180),
-                ),
-              ),
-            ] else ...[
-              Text(
-                widget.label,
-                style: TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.bold,
-                  color: widget.textColor,
-                ),
-              ),
-              if (widget.count > 0)
-                Text(
-                  '${widget.count}个',
+                  ],
+                )
+              : Text(
+                  widget.type,
                   style: TextStyle(
-                    fontSize: 11,
-                    color: widget.textColor.withAlpha(180),
+                    fontSize: 28,
+                    fontWeight: FontWeight.bold,
+                    color: widget.textColor,
                   ),
                 ),
-            ],
-          ],
         ),
       ),
     );
