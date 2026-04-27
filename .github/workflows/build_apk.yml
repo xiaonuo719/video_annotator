@@ -30,9 +30,14 @@ jobs:
 
       - name: Install Android NDKs
         run: |
+          set -euo pipefail
           SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          if [ -z "$SDK_ROOT" ]; then
+            echo "ANDROID_SDK_ROOT/ANDROID_HOME is not set" >&2
+            exit 1
+          fi
           SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-          yes | "$SDKMANAGER" --licenses
+          yes | head -n 100 | "$SDKMANAGER" --licenses
           "$SDKMANAGER" "ndk;28.2.13676358" "ndk;27.0.11902837"
 
       - name: Get dependencies
