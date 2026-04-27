@@ -637,14 +637,6 @@ packages:
       url: "https://pub.flutter-io.cn"
     source: hosted
     version: "1.10.2"
-  speech_xf:
-    dependency: "direct main"
-    description:
-      name: speech_xf
-      sha256: "62612c8a0273a46917b099e644cfadc5b54033322e2e0a91fb536f1053ae5dbf"
-      url: "https://pub.flutter-io.cn"
-    source: hosted
-    version: "1.3.0"
   stack_trace:
     dependency: transitive
     description:
