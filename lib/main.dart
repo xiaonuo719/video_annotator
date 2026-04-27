@@ -2,7 +2,9 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:just_audio/just_audio.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
 import 'package:record/record.dart';
 import 'package:share_plus/share_plus.dart';
@@ -92,6 +94,8 @@ class ClipSegment {
 
   String get timeRange => '${_msToTime(startMs)} → ${_msToTime(endMs)}';
 
+  String get startTimeStr => _msToTime(startMs);
+
   String get durationStr {
     final sec = (endMs - startMs) ~/ 1000;
     return '${sec}s';
@@ -160,12 +164,11 @@ class ProjectService {
 
   static Future<String> generateProjectPath() async {
     final dir = await _projectDir;
-    final timestamp = DateTime.now()
-        .toIso8601String()
-        .replaceAll(':', '-')
-        .split('.')
-        .first;
-    return '$dir/video_annotator_$timestamp.va';
+    final now = DateTime.now();
+    final timestamp =
+        '${now.year}${now.month.toString().padLeft(2, '0')}${now.day.toString().padLeft(2, '0')}_'
+        '${now.hour.toString().padLeft(2, '0')}${now.minute.toString().padLeft(2, '0')}${now.second.toString().padLeft(2, '0')}';
+    return '$dir/$timestamp.va';
   }
 
   static Future<String> getRecordingsDir(String projectPath) async {
@@ -228,64 +231,148 @@ class ProjectService {
   static String generateClipId() => _uuid.v4();
 }
 
+// ==================== Whisper Models ====================
+
+enum WhisperModelSize { tiny, base, small, medium }
+
+extension WhisperModelSizeExt on WhisperModelSize {
+  String get displayName {
+    switch (this) {
+      case WhisperModelSize.tiny:
+        return 'Tiny (~39MB)';
+      case WhisperModelSize.base:
+        return 'Base (~140MB)';
+      case WhisperModelSize.small:
+        return 'Small (~466MB)';
+      case WhisperModelSize.medium:
+        return 'Medium (~1.5GB)';
+    }
+  }
+
+  String get fileName {
+    switch (this) {
+      case WhisperModelSize.tiny:
+        return 'ggml-tiny.bin';
+      case WhisperModelSize.base:
+        return 'ggml-base.bin';
+      case WhisperModelSize.small:
+        return 'ggml-small.bin';
+      case WhisperModelSize.medium:
+        return 'ggml-medium.bin';
+    }
+  }
+
+  WhisperModel get toWhisperModel {
+    switch (this) {
+      case WhisperModelSize.tiny:
+        return WhisperModel.tiny;
+      case WhisperModelSize.base:
+        return WhisperModel.base;
+      case WhisperModelSize.small:
+        return WhisperModel.small;
+      case WhisperModelSize.medium:
+        return WhisperModel.medium;
+    }
+  }
+}
+
 // ==================== Whisper Service ====================
 
 class WhisperService {
-  static const _model = WhisperModel.base;
   static const _downloadHost =
       'https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main';
-  static const _modelFileName = 'ggml-base.bin';
-  static const _modelSizeLabel = '~140MB';
 
   static Future<String> get _modelDir async {
     final dir = await getApplicationSupportDirectory();
     return dir.path;
   }
 
-  static Future<bool> isModelDownloaded() async {
+  static Future<bool> isModelDownloaded(WhisperModelSize size) async {
     final dir = await _modelDir;
-    final file = File('$dir/$_modelFileName');
+    final file = File('$dir/${size.fileName}');
     return file.existsSync();
   }
 
-  static Future<void> downloadModel({
+  static Future<void> downloadModel(
+    WhisperModelSize size, {
     void Function(double progress)? onProgress,
+    void Function(String error)? onError,
   }) async {
     final dir = await _modelDir;
-    final file = File('$dir/$_modelFileName');
+    final file = File('$dir/${size.fileName}');
 
     if (file.existsSync()) return;
 
-    final uri = Uri.parse('$_downloadHost/$_modelFileName');
-    final request = await HttpClient().getUrl(uri);
-    final response = await request.close();
+    try {
+      final uri = Uri.parse('$_downloadHost/${size.fileName}');
+      final request = await HttpClient().getUrl(uri);
+      final response = await request.close();
 
-    final contentLength = response.contentLength ?? 0;
-    int received = 0;
-
-    final raf = file.openSync(mode: FileMode.write);
-    await for (var chunk in response) {
-      raf.writeFromSync(chunk);
-      received += chunk.length;
-      if (contentLength > 0 && onProgress != null) {
-        onProgress(received / contentLength);
+      if (response.statusCode != 200) {
+        onError?.call('下载失败: HTTP ${response.statusCode}');
+        return;
       }
+
+      final contentLength = response.contentLength;
+      int received = 0;
+
+      final raf = file.openSync(mode: FileMode.write);
+      await for (var chunk in response) {
+        raf.writeFromSync(chunk);
+        received += chunk.length;
+        if (contentLength > 0 && onProgress != null) {
+          onProgress(received / contentLength);
+        }
+      }
+      await raf.close();
+    } catch (e) {
+      onError?.call('下载失败: $e');
     }
-    await raf.close();
   }
 
-  static Future<void> deleteModel() async {
+  static Future<void> deleteModel(WhisperModelSize size) async {
     final dir = await _modelDir;
-    final file = File('$dir/$_modelFileName');
+    final file = File('$dir/${size.fileName}');
     if (file.existsSync()) {
       file.deleteSync();
     }
   }
 
-  static Future<String?> transcribe(String audioPath) async {
+  static Future<String?> transcribe(
+    String audioPath,
+    WhisperModelSize size, {
+    String? apiKey,
+    String? apiEndpoint,
+  }) async {
+    // If API mode is configured, use API
+    if (apiKey != null && apiKey.isNotEmpty && apiEndpoint != null) {
+      return _transcribeViaApi(audioPath, apiKey, apiEndpoint);
+    }
+
+    // Otherwise use local model
+    return _transcribeLocal(audioPath, size);
+  }
+
+  static Future<String?> _transcribeLocal(
+    String audioPath,
+    WhisperModelSize size,
+  ) async {
     final dir = await _modelDir;
+    final modelFile = File('$dir/${size.fileName}');
+
+    // Check if model exists
+    if (!modelFile.existsSync()) {
+      return null;
+    }
+
+    // Check if audio file exists
+    final audioFile = File(audioPath);
+    if (!audioFile.existsSync()) {
+      return null;
+    }
+
     final whisper = Whisper(
-      model: _model,
+      model: size.toWhisperModel,
       modelDir: dir,
       downloadHost: _downloadHost,
     );
@@ -298,7 +385,44 @@ class WhisperService {
           isNoTimestamps: true,
         ),
       );
-      return result.text?.trim();
+      return result.text.trim();
+    } catch (e) {
+      return null;
+    }
+  }
+
+  static Future<String?> _transcribeViaApi(
+    String audioPath,
+    String apiKey,
+    String apiEndpoint,
+  ) async {
+    try {
+      final file = File(audioPath);
+      final bytes = await file.readAsBytes();
+      final base64Audio = base64Encode(bytes);
+
+      final uri = Uri.parse(apiEndpoint);
+      final request = await HttpClient().postUrl(uri);
+
+      request.headers.set('Content-Type', 'application/json');
+      request.headers.set('Authorization', 'Bearer $apiKey');
+
+      final body = jsonEncode({
+        'model': 'whisper-1',
+        'audio': base64Audio,
+      });
+
+      request.write(body);
+
+      final response = await request.close();
+      final responseBody = await response.transform(utf8.decoder).join();
+
+      if (response.statusCode == 200) {
+        final json = jsonDecode(responseBody) as Map<String, dynamic>;
+        return json['text'] as String?;
+      } else {
+        return null;
+      }
     } catch (e) {
       return null;
     }
@@ -323,15 +447,25 @@ class AppState extends ChangeNotifier {
   final AudioRecorder _recorder = AudioRecorder();
   String? _recordingPath;
   String? _recordingId;
+  int _recordingStartMs = 0; // Save elapsed when recording starts
 
   // Model state
+  WhisperModelSize _selectedModelSize = WhisperModelSize.base;
   bool _isModelDownloaded = false;
   bool _isDownloading = false;
   double _downloadProgress = 0;
 
+  // API mode
+  bool _useApiMode = false;
+  String? _apiKey;
+  String? _apiEndpoint;
+
   // Project state
   String? _currentProjectPath;
   bool _isDirty = false;
+
+  // Transcription state
+  String? _transcribingClipId;
 
   // Navigation state
   int _selectedIndex = 0;
@@ -350,6 +484,12 @@ class AppState extends ChangeNotifier {
   String? get currentProjectPath => _currentProjectPath;
   bool get isDirty => _isDirty;
   int get selectedIndex => _selectedIndex;
+  WhisperModelSize get selectedModelSize => _selectedModelSize;
+  bool get useApiMode => _useApiMode;
+  String? get apiKey => _apiKey;
+  String? get apiEndpoint => _apiEndpoint;
+  bool get isModelAvailable => _isModelDownloaded || _useApiMode;
+  String? get transcribingClipId => _transcribingClipId;
 
   String get formattedTime {
     final totalSeconds = _elapsedMs ~/ 1000;
@@ -373,7 +513,7 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> checkModelStatus() async {
-    _isModelDownloaded = await WhisperService.isModelDownloaded();
+    _isModelDownloaded = await WhisperService.isModelDownloaded(_selectedModelSize);
     notifyListeners();
   }
 
@@ -385,6 +525,7 @@ class AppState extends ChangeNotifier {
 
     try {
       await WhisperService.downloadModel(
+        _selectedModelSize,
         onProgress: (p) {
           _downloadProgress = p;
           notifyListeners();
@@ -400,8 +541,29 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> deleteModel() async {
-    await WhisperService.deleteModel();
+    await WhisperService.deleteModel(_selectedModelSize);
     _isModelDownloaded = false;
+    notifyListeners();
+  }
+
+  void setSelectedModelSize(WhisperModelSize size) {
+    if (_selectedModelSize == size) return;
+    _selectedModelSize = size;
+    checkModelStatus();
+  }
+
+  void setUseApiMode(bool value) {
+    _useApiMode = value;
+    notifyListeners();
+  }
+
+  void setApiKey(String? value) {
+    _apiKey = value;
+    notifyListeners();
+  }
+
+  void setApiEndpoint(String? value) {
+    _apiEndpoint = value;
     notifyListeners();
   }
 
@@ -410,8 +572,19 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<bool> requestMicrophonePermission() async {
+    final status = await Permission.microphone.request();
+    return status.isGranted;
+  }
+
   void start() async {
     if (_isRunning) return;
+
+    // Auto-create project if none exists
+    if (_currentProjectPath == null) {
+      await newProject();
+    }
+
     _isRunning = true;
     WakelockPlus.enable();
     _timer = Timer.periodic(const Duration(milliseconds: 100), (_) {
@@ -427,6 +600,12 @@ class AppState extends ChangeNotifier {
     WakelockPlus.disable();
     _timer?.cancel();
     _timer = null;
+
+    // Auto-save project when stopping
+    if (_currentProjectPath != null && _clips.isNotEmpty) {
+      await _autoSaveProject();
+    }
+
     notifyListeners();
   }
 
@@ -441,28 +620,53 @@ class AppState extends ChangeNotifier {
   void onMarkButtonPressed(String type) async {
     if (_isRecording) return;
 
-    if (!_isModelDownloaded) {
+    _recordingType = type;
+    _recordingSecondsLeft = 10;
+    _recordingId = ProjectService.generateClipId();
+    _recordingStartMs = _elapsedMs; // Save elapsed at button press
+
+    // Check if we can do recording + transcription
+    final canRecord = _isModelDownloaded || _useApiMode;
+
+    if (!canRecord) {
+      // No-model mode: add clip immediately without audio
+      _addClipImmediate(type);
       return;
     }
 
-    _recordingType = type;
-    _recordingSecondsLeft = 10;
+    // Request microphone permission
+    final hasPermission = await requestMicrophonePermission();
+    if (!hasPermission) {
+      // Permission denied, fall back to no-model mode
+      _recordingId = null;
+      _addClipImmediate(type);
+      return;
+    }
+
     _isRecording = true;
-    _recordingId = ProjectService.generateClipId();
     notifyListeners();
 
     final dir = await getTemporaryDirectory();
     _recordingPath =
         '${dir.path}/recording_${DateTime.now().millisecondsSinceEpoch}.m4a';
 
-    await _recorder.start(
-      const RecordConfig(
-        encoder: AudioEncoder.aacLc,
-        bitRate: 128000,
-        sampleRate: 44100,
-      ),
-      path: _recordingPath!,
-    );
+    try {
+      await _recorder.start(
+        const RecordConfig(
+          encoder: AudioEncoder.aacLc,
+          bitRate: 128000,
+          sampleRate: 44100,
+        ),
+        path: _recordingPath!,
+      );
+    } catch (e) {
+      // Recording failed, fall back to no-model mode
+      _isRecording = false;
+      _recordingId = null;
+      notifyListeners();
+      _addClipImmediate(type);
+      return;
+    }
 
     Timer.periodic(const Duration(seconds: 1), (t) {
       _recordingSecondsLeft--;
@@ -472,6 +676,41 @@ class AppState extends ChangeNotifier {
         _stopRecordingAndTranscribe();
       }
     });
+  }
+
+  void _addClipImmediate(String type) {
+    if (_recordingId == null) return;
+    final clipId = _recordingId!;
+    final wallClock = DateTime.now();
+    final elapsed = _recordingStartMs;
+
+    if (type == '亮点') {
+      _highlightCount++;
+    } else if (type == '不足') {
+      _issueCount++;
+    }
+
+    final start = (elapsed - _windowSeconds * 1000).clamp(0, elapsed);
+    final end = elapsed + _windowSeconds * 1000;
+
+    final clip = ClipSegment(
+      id: clipId,
+      startMs: start,
+      endMs: end,
+      type: type,
+      index: type == '亮点' ? _highlightCount : _issueCount,
+      wallClockTime: wallClock,
+      audioPath: null,
+    );
+    _clips.add(clip);
+    _isDirty = true;
+    _recordingId = null;
+    notifyListeners();
+
+    // Auto-save if project is open
+    if (_currentProjectPath != null) {
+      _autoSaveProject();
+    }
   }
 
   void cancelRecording() {
@@ -489,7 +728,7 @@ class AppState extends ChangeNotifier {
 
     final path = _recordingPath!;
     final type = _recordingType!;
-    final elapsed = _elapsedMs;
+    final elapsed = _recordingStartMs; // Use saved elapsed at recording start
     final clipId = _recordingId!;
     final wallClock = DateTime.now();
 
@@ -540,8 +779,18 @@ class AppState extends ChangeNotifier {
     notifyListeners();
 
     // Transcribe in background (use original temp path if not copied)
+    _transcribingClipId = clipId;
+    notifyListeners();
+
     final transcribePath = audioPath ?? path;
-    final remark = await WhisperService.transcribe(transcribePath);
+    final remark = await WhisperService.transcribe(
+      transcribePath,
+      _selectedModelSize,
+      apiKey: _useApiMode ? _apiKey : null,
+      apiEndpoint: _useApiMode ? _apiEndpoint : null,
+    );
+
+    _transcribingClipId = null;
 
     final idx = _clips.indexWhere((c) => c.id == clipId);
     if (idx != -1) {
@@ -783,28 +1032,17 @@ class _HomePage extends StatelessWidget {
 
     return Scaffold(
       appBar: AppBar(
-        title: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(state.projectName),
-            if (state.isDirty) ...[
-              const SizedBox(width: 4),
-              const Text('*', style: TextStyle(fontWeight: FontWeight.bold)),
-            ],
-          ],
-        ),
-        centerTitle: true,
         elevation: 0,
         automaticallyImplyLeading: false,
       ),
       body: SafeArea(
         child: Column(
           children: [
-            _CompactTimerHeader(),
+            _ProjectHeader(),
+            _ProjectActionsRow(),
             const Divider(height: 1),
             Expanded(child: _ClipListSection()),
             _MarkButtonsRow(),
-            _BottomActionsSection(),
           ],
         ),
       ),
@@ -812,9 +1050,9 @@ class _HomePage extends StatelessWidget {
   }
 }
 
-// ==================== Compact Timer Header ====================
+// ==================== Project Header ====================
 
-class _CompactTimerHeader extends StatelessWidget {
+class _ProjectHeader extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
@@ -822,41 +1060,150 @@ class _CompactTimerHeader extends StatelessWidget {
 
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Project name row
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  state.projectName,
+                  style: theme.textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.bold,
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              if (state.isDirty)
+                const Text('*', style: TextStyle(fontWeight: FontWeight.bold)),
+            ],
+          ),
+          const SizedBox(height: 8),
+          // Timer and controls row
+          Row(
+            children: [
+              IconButton(
+                onPressed: () => state.toggle(),
+                icon: Icon(
+                  state.isRunning ? Icons.stop : Icons.play_arrow,
+                  color: state.isRunning ? Colors.red : Colors.green,
+                ),
+                style: IconButton.styleFrom(
+                  backgroundColor: (state.isRunning ? Colors.red : Colors.green)
+                      .withAlpha(26),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Text(
+                state.formattedTime,
+                style: TextStyle(
+                  fontSize: 36,
+                  fontWeight: FontWeight.w300,
+                  fontFamily: 'monospace',
+                  color: state.isRunning
+                      ? theme.colorScheme.primary
+                      : theme.colorScheme.onSurface,
+                ),
+              ),
+              const Spacer(),
+              Text(
+                '${state.clips.length} 个片段',
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ==================== Project Actions Row ====================
+
+class _ProjectActionsRow extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppState>();
+    final theme = Theme.of(context);
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
       child: Row(
         children: [
-          IconButton(
-            onPressed: () => state.toggle(),
-            icon: Icon(
-              state.isRunning ? Icons.stop : Icons.play_arrow,
-              color: state.isRunning ? Colors.red : Colors.green,
-            ),
-            style: IconButton.styleFrom(
-              backgroundColor: (state.isRunning ? Colors.red : Colors.green)
-                  .withAlpha(26),
-            ),
-          ),
-          const SizedBox(width: 12),
-          Text(
-            state.formattedTime,
-            style: TextStyle(
-              fontSize: 36,
-              fontWeight: FontWeight.w300,
-              fontFamily: 'monospace',
-              color: state.isRunning
-                  ? theme.colorScheme.primary
-                  : theme.colorScheme.onSurface,
+          Expanded(
+            child: OutlinedButton.icon(
+              onPressed: () {
+                state.newProject();
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('已创建新项目')),
+                );
+              },
+              icon: const Icon(Icons.add, size: 18),
+              label: const Text('新建'),
             ),
           ),
-          const Spacer(),
-          Text(
-            '${state.clips.length} 个片段',
-            style: theme.textTheme.bodyMedium?.copyWith(
-              color: theme.colorScheme.onSurfaceVariant,
+          const SizedBox(width: 8),
+          Expanded(
+            child: OutlinedButton.icon(
+              onPressed: state.clips.isNotEmpty
+                  ? () {
+                      state.saveProject();
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text('已保存: ${state.projectName}')),
+                      );
+                    }
+                  : null,
+              icon: const Icon(Icons.save, size: 18),
+              label: const Text('保存'),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: OutlinedButton.icon(
+              onPressed: state.currentProjectPath != null
+                  ? () => _confirmDeleteProject(context, state)
+                  : null,
+              icon: Icon(Icons.delete, size: 18, color: Colors.red.shade400),
+              label: Text('删除',
+                  style: TextStyle(color: Colors.red.shade400)),
             ),
           ),
         ],
       ),
     );
+  }
+
+  Future<void> _confirmDeleteProject(BuildContext context, AppState state) async {
+    final name = state.projectName;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('确认删除'),
+        content: Text('确定要删除项目 "$name" 吗？此操作不可恢复。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true) {
+      await state.deleteCurrentProject();
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('已删除: $name')),
+        );
+      }
+    }
   }
 }
 
@@ -895,8 +1242,6 @@ class _ProjectsPageState extends State<_ProjectsPage> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('项目列表'),
-        centerTitle: true,
         elevation: 0,
         automaticallyImplyLeading: false,
         actions: [
@@ -1049,6 +1394,54 @@ class _ProjectsPageState extends State<_ProjectsPage> {
   }
 }
 
+// ==================== Mode Chip ====================
+
+class _ModeChip extends StatelessWidget {
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+
+  const _ModeChip({
+    required this.label,
+    required this.selected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 150),
+        padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 16),
+        decoration: BoxDecoration(
+          color: selected
+              ? theme.colorScheme.primaryContainer
+              : theme.colorScheme.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: selected
+                ? theme.colorScheme.primary
+                : theme.colorScheme.outline.withAlpha(77),
+            width: selected ? 2 : 1,
+          ),
+        ),
+        child: Text(
+          label,
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            color: selected
+                ? theme.colorScheme.onPrimaryContainer
+                : theme.colorScheme.onSurfaceVariant,
+            fontWeight: selected ? FontWeight.bold : FontWeight.normal,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 // ==================== Settings Page ====================
 
 class _SettingsPage extends StatelessWidget {
@@ -1061,8 +1454,6 @@ class _SettingsPage extends StatelessWidget {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('设置'),
-        centerTitle: true,
         elevation: 0,
         automaticallyImplyLeading: false,
       ),
@@ -1125,70 +1516,169 @@ class _SettingsPage extends StatelessWidget {
 
             const SizedBox(height: 24),
 
-            // Model download section
+            // Model and API section
             Text(
-              '语音转文字模型',
+              '语音转文字',
               style: theme.textTheme.titleSmall?.copyWith(
                 color: theme.colorScheme.primary,
               ),
             ),
-            const SizedBox(height: 8),
-            Text('Whisper Base 模型（约 140MB）', style: theme.textTheme.bodySmall),
             const SizedBox(height: 12),
 
             Card(
               child: Padding(
                 padding: const EdgeInsets.all(16),
-                child: state.isModelDownloaded
-                    ? Row(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Mode selection
+                    Row(
+                      children: [
+                        Expanded(
+                          child: _ModeChip(
+                            label: '本地模型',
+                            selected: !state.useApiMode,
+                            onTap: () => state.setUseApiMode(false),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: _ModeChip(
+                            label: 'API 模式',
+                            selected: state.useApiMode,
+                            onTap: () => state.setUseApiMode(true),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+
+                    if (!state.useApiMode) ...[
+                      // Model size selection
+                      Text('模型大小', style: theme.textTheme.bodySmall),
+                      const SizedBox(height: 8),
+                      DropdownButton<WhisperModelSize>(
+                        value: state.selectedModelSize,
+                        isExpanded: true,
+                        items: WhisperModelSize.values.map((size) {
+                          return DropdownMenuItem(
+                            value: size,
+                            child: Text(size.displayName),
+                          );
+                        }).toList(),
+                        onChanged: (size) {
+                          if (size != null) {
+                            state.setSelectedModelSize(size);
+                          }
+                        },
+                      ),
+                      const SizedBox(height: 16),
+
+                      // Model status / download
+                      state.isModelDownloaded
+                          ? Row(
+                              children: [
+                                const Icon(
+                                  Icons.check_circle,
+                                  color: Colors.green,
+                                  size: 20,
+                                ),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: Text(
+                                    '已下载 ${state.selectedModelSize.displayName}',
+                                    style: const TextStyle(color: Colors.green),
+                                  ),
+                                ),
+                                TextButton(
+                                  onPressed: () async {
+                                    await state.deleteModel();
+                                  },
+                                  child: const Text(
+                                    '删除',
+                                    style: TextStyle(color: Colors.red),
+                                  ),
+                                ),
+                              ],
+                            )
+                          : state.isDownloading
+                          ? Row(
+                              children: [
+                                Expanded(
+                                  child: LinearProgressIndicator(
+                                    value: state.downloadProgress,
+                                    borderRadius: BorderRadius.circular(4),
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Text(
+                                  '${(state.downloadProgress * 100).toInt()}%',
+                                  style: theme.textTheme.bodySmall,
+                                ),
+                              ],
+                            )
+                          : SizedBox(
+                              width: double.infinity,
+                              child: FilledButton.icon(
+                                onPressed: () => state.downloadModel(),
+                                icon: const Icon(Icons.download),
+                                label: const Text('下载模型'),
+                              ),
+                            ),
+                    ] else ...[
+                      // API configuration
+                      TextField(
+                        decoration: const InputDecoration(
+                          labelText: 'API Key',
+                          hintText: 'sk-...',
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                        onChanged: (v) => state.setApiKey(v),
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        decoration: const InputDecoration(
+                          labelText: 'API Endpoint',
+                          hintText: 'https://api.openai.com/v1/audio/transcriptions',
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                        onChanged: (v) => state.setApiEndpoint(v),
+                      ),
+                    ],
+
+                    const SizedBox(height: 12),
+                    // No-model mode hint
+                    Container(
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: theme.colorScheme.surfaceContainerHighest.withAlpha(77),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Row(
                         children: [
-                          const Icon(
-                            Icons.check_circle,
-                            color: Colors.green,
-                            size: 20,
+                          Icon(
+                            Icons.info_outline,
+                            size: 16,
+                            color: theme.colorScheme.onSurfaceVariant,
                           ),
                           const SizedBox(width: 8),
-                          const Expanded(
-                            child: Text(
-                              '已下载',
-                              style: TextStyle(color: Colors.green),
-                            ),
-                          ),
-                          TextButton(
-                            onPressed: () async {
-                              await state.deleteModel();
-                            },
-                            child: const Text(
-                              '删除',
-                              style: TextStyle(color: Colors.red),
-                            ),
-                          ),
-                        ],
-                      )
-                    : state.isDownloading
-                    ? Row(
-                        children: [
                           Expanded(
-                            child: LinearProgressIndicator(
-                              value: state.downloadProgress,
-                              borderRadius: BorderRadius.circular(4),
+                            child: Text(
+                              state.useApiMode || state.isModelDownloaded
+                                  ? '支持录音标注'
+                                  : '无模型/无API，仅标记时间点',
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
                             ),
                           ),
-                          const SizedBox(width: 12),
-                          Text(
-                            '${(state.downloadProgress * 100).toInt()}%',
-                            style: theme.textTheme.bodySmall,
-                          ),
                         ],
-                      )
-                    : SizedBox(
-                        width: double.infinity,
-                        child: FilledButton.icon(
-                          onPressed: () => state.downloadModel(),
-                          icon: const Icon(Icons.download),
-                          label: const Text('下载模型'),
-                        ),
                       ),
+                    ),
+                  ],
+                ),
               ),
             ),
 
@@ -1290,19 +1780,72 @@ class _SettingsPage extends StatelessWidget {
 
 // ==================== Project Viewer Page (Read-only) ====================
 
-class _ProjectViewerPage extends StatelessWidget {
+class _ProjectViewerPage extends StatefulWidget {
   final String projectPath;
   final Project project;
 
   const _ProjectViewerPage({required this.projectPath, required this.project});
 
   @override
+  State<_ProjectViewerPage> createState() => _ProjectViewerPageState();
+}
+
+class _ProjectViewerPageState extends State<_ProjectViewerPage> {
+  String? _playingClipId;
+  final AudioPlayer _audioPlayer = AudioPlayer();
+
+  @override
+  void initState() {
+    super.initState();
+    _audioPlayer.playerStateStream.listen((state) {
+      if (state.processingState == ProcessingState.completed) {
+        setState(() {
+          _playingClipId = null;
+        });
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _audioPlayer.dispose();
+    super.dispose();
+  }
+
+  Future<void> _exportTxt() async {
+    final sorted = List<ClipSegment>.from(widget.project.clips)
+      ..sort((a, b) => a.startMs.compareTo(b.startMs));
+    final content = sorted.map((c) => c.toTxtLine()).join('\n');
+
+    final dir = await getTemporaryDirectory();
+    final name = widget.projectPath.split('/').last.replaceAll('.va', '');
+    final file = File('${dir.path}/$name.txt');
+    await file.writeAsString(content);
+
+    await Share.shareXFiles(
+      [XFile(file.path)],
+      text: '视频标注导出',
+    );
+  }
+
+  @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final name = projectPath.split('/').last.replaceAll('.va', '');
+    final name = widget.projectPath.split('/').last.replaceAll('.va', '');
 
     return Scaffold(
-      appBar: AppBar(title: Text(name), centerTitle: true, elevation: 0),
+      appBar: AppBar(
+        title: Text(name),
+        centerTitle: true,
+        elevation: 0,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.share),
+            onPressed: _exportTxt,
+            tooltip: '导出TXT',
+          ),
+        ],
+      ),
       body: SafeArea(
         child: Column(
           children: [
@@ -1330,13 +1873,13 @@ class _ProjectViewerPage extends StatelessWidget {
                         ),
                         const SizedBox(height: 4),
                         Text(
-                          '创建: ${_formatDate(project.createdAt)}',
+                          '创建: ${_formatDate(widget.project.createdAt)}',
                           style: theme.textTheme.bodySmall?.copyWith(
                             color: theme.colorScheme.onSurfaceVariant,
                           ),
                         ),
                         Text(
-                          '片段数: ${project.clips.length}',
+                          '片段数: ${widget.project.clips.length}',
                           style: theme.textTheme.bodySmall?.copyWith(
                             color: theme.colorScheme.onSurfaceVariant,
                           ),
@@ -1350,7 +1893,7 @@ class _ProjectViewerPage extends StatelessWidget {
             const Divider(height: 1),
             // Clip list
             Expanded(
-              child: project.clips.isEmpty
+              child: widget.project.clips.isEmpty
                   ? Center(
                       child: Text(
                         '无片段',
@@ -1361,10 +1904,19 @@ class _ProjectViewerPage extends StatelessWidget {
                     )
                   : ListView.builder(
                       padding: const EdgeInsets.all(8),
-                      itemCount: project.clips.length,
+                      itemCount: widget.project.clips.length,
                       itemBuilder: (ctx, i) {
-                        final clip = project.clips[i];
-                        return _ViewerClipItem(clip: clip);
+                        final clip = widget.project.clips[i];
+                        return _ViewerClipItem(
+                          clip: clip,
+                          isPlaying: _playingClipId == clip.id,
+                          onPlay: clip.audioPath != null
+                              ? () => _playAudio(clip)
+                              : null,
+                          onStop: _playingClipId == clip.id
+                              ? () => _stopAudio()
+                              : null,
+                        );
                       },
                     ),
             ),
@@ -1372,6 +1924,33 @@ class _ProjectViewerPage extends StatelessWidget {
         ),
       ),
     );
+  }
+
+  Future<void> _playAudio(ClipSegment clip) async {
+    if (clip.audioPath == null) return;
+
+    // Stop any currently playing audio
+    await _audioPlayer.stop();
+
+    try {
+      await _audioPlayer.setFilePath(clip.audioPath!);
+      await _audioPlayer.play();
+      setState(() {
+        _playingClipId = clip.id;
+      });
+    } catch (e) {
+      // Playback failed
+      setState(() {
+        _playingClipId = null;
+      });
+    }
+  }
+
+  void _stopAudio() {
+    _audioPlayer.stop();
+    setState(() {
+      _playingClipId = null;
+    });
   }
 
   String _formatDate(DateTime dt) {
@@ -1382,8 +1961,16 @@ class _ProjectViewerPage extends StatelessWidget {
 
 class _ViewerClipItem extends StatelessWidget {
   final ClipSegment clip;
+  final bool isPlaying;
+  final VoidCallback? onPlay;
+  final VoidCallback? onStop;
 
-  const _ViewerClipItem({required this.clip});
+  const _ViewerClipItem({
+    required this.clip,
+    this.isPlaying = false,
+    this.onPlay,
+    this.onStop,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -1426,14 +2013,26 @@ class _ViewerClipItem extends StatelessWidget {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(
-                        clip.timeRange,
-                        style: const TextStyle(
-                          fontFamily: 'monospace',
-                          fontSize: 16,
-                          fontWeight: FontWeight.w500,
+                      // Show remark/transcription if available
+                      if (clip.remark != null && clip.remark!.isNotEmpty)
+                        Text(
+                          clip.remark!,
+                          style: const TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w500,
+                          ),
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        )
+                      else
+                        Text(
+                          clip.startTimeStr,
+                          style: const TextStyle(
+                            fontFamily: 'monospace',
+                            fontSize: 16,
+                            fontWeight: FontWeight.w500,
+                          ),
                         ),
-                      ),
                       const SizedBox(height: 4),
                       Row(
                         children: [
@@ -1464,15 +2063,23 @@ class _ViewerClipItem extends StatelessWidget {
                             ),
                           ),
                           const SizedBox(width: 8),
-                          Icon(
-                            Icons.mic,
-                            size: 14,
-                            color: clip.audioPath != null
-                                ? theme.colorScheme.primary
-                                : theme.colorScheme.onSurfaceVariant.withAlpha(
-                                    77,
-                                  ),
-                          ),
+                          if (clip.audioPath != null)
+                            GestureDetector(
+                              onTap: isPlaying ? onStop : onPlay,
+                              child: Icon(
+                                isPlaying ? Icons.stop_circle : Icons.play_circle,
+                                size: 20,
+                                color: isPlaying
+                                    ? theme.colorScheme.primary
+                                    : theme.colorScheme.onSurfaceVariant,
+                              ),
+                            )
+                          else
+                            Icon(
+                              Icons.mic_off,
+                              size: 14,
+                              color: theme.colorScheme.onSurfaceVariant.withAlpha(77),
+                            ),
                           const SizedBox(width: 4),
                           Text(
                             _formatTime(clip.wallClockTime),
@@ -1549,13 +2156,7 @@ class _MarkButtonsRow extends StatelessWidget {
               isRecording: state.isRecording && state.recordingType == '接管',
               recordingSecondsLeft: state.recordingSecondsLeft,
               onTap: () {
-                if (!state.isModelDownloaded) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('请先在设置中下载语音模型'),
-                      duration: Duration(seconds: 2),
-                    ),
-                  );
+                if (!state.isModelAvailable && state.isRecording) {
                   return;
                 }
                 if (!state.isRecording) {
@@ -1574,13 +2175,7 @@ class _MarkButtonsRow extends StatelessWidget {
               isRecording: state.isRecording && state.recordingType == '亮点',
               recordingSecondsLeft: state.recordingSecondsLeft,
               onTap: () {
-                if (!state.isModelDownloaded) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('请先在设置中下载语音模型'),
-                      duration: Duration(seconds: 2),
-                    ),
-                  );
+                if (!state.isModelAvailable && state.isRecording) {
                   return;
                 }
                 if (!state.isRecording) {
@@ -1599,13 +2194,7 @@ class _MarkButtonsRow extends StatelessWidget {
               isRecording: state.isRecording && state.recordingType == '不足',
               recordingSecondsLeft: state.recordingSecondsLeft,
               onTap: () {
-                if (!state.isModelDownloaded) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('请先在设置中下载语音模型'),
-                      duration: Duration(seconds: 2),
-                    ),
-                  );
+                if (!state.isModelAvailable && state.isRecording) {
                   return;
                 }
                 if (!state.isRecording) {
@@ -1671,9 +2260,9 @@ class _CompactMarkButtonState extends State<_CompactMarkButton> {
       },
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 100),
-        height: 56,
+        height: 112,
         decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(16),
           color: isThisRecording
               ? widget.color.withAlpha(77)
               : _flash
@@ -1704,7 +2293,7 @@ class _CompactMarkButtonState extends State<_CompactMarkButton> {
                     Text(
                       '${widget.recordingSecondsLeft}s',
                       style: TextStyle(
-                        fontSize: 16,
+                        fontSize: 24,
                         fontWeight: FontWeight.bold,
                         color: widget.textColor,
                       ),
@@ -1714,7 +2303,7 @@ class _CompactMarkButtonState extends State<_CompactMarkButton> {
               : Text(
                   widget.type,
                   style: TextStyle(
-                    fontSize: 18,
+                    fontSize: 28,
                     fontWeight: FontWeight.bold,
                     color: widget.textColor,
                   ),
@@ -1817,7 +2406,7 @@ class _ClipItem extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    clip.timeRange,
+                    clip.startTimeStr,
                     style: const TextStyle(
                       fontFamily: 'monospace',
                       fontSize: 14,
