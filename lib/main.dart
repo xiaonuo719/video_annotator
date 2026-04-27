@@ -197,6 +197,34 @@ class ProjectService {
     }
   }
 
+  static Future<List<String>> listProjects() async {
+    final dir = await _projectDir;
+    final directory = Directory(dir);
+    if (!await directory.exists()) return [];
+
+    final files = await directory.list().toList();
+    return files
+        .whereType<File>()
+        .where((f) => f.path.endsWith('.va'))
+        .map((f) => f.path)
+        .toList()
+      ..sort((a, b) => b.compareTo(a)); // newest first
+  }
+
+  static Future<void> deleteProject(String projectPath) async {
+    final file = File(projectPath);
+    if (await file.exists()) {
+      await file.delete();
+    }
+    // Delete recordings directory
+    final recordingsDir = Directory(
+      '${_getProjectPath(projectPath)}/recordings',
+    );
+    if (await recordingsDir.exists()) {
+      await recordingsDir.delete(recursive: true);
+    }
+  }
+
   static String generateClipId() => _uuid.v4();
 }
 
@@ -305,6 +333,9 @@ class AppState extends ChangeNotifier {
   String? _currentProjectPath;
   bool _isDirty = false;
 
+  // Navigation state
+  int _selectedIndex = 0;
+
   // Getters
   bool get isRunning => _isRunning;
   int get elapsedMs => _elapsedMs;
@@ -318,6 +349,7 @@ class AppState extends ChangeNotifier {
   double get downloadProgress => _downloadProgress;
   String? get currentProjectPath => _currentProjectPath;
   bool get isDirty => _isDirty;
+  int get selectedIndex => _selectedIndex;
 
   String get formattedTime {
     final totalSeconds = _elapsedMs ~/ 1000;
@@ -333,6 +365,11 @@ class AppState extends ChangeNotifier {
     if (_currentProjectPath == null) return '未命名项目';
     final name = _currentProjectPath!.split('/').last.replaceAll('.va', '');
     return name;
+  }
+
+  void setSelectedIndex(int index) {
+    _selectedIndex = index;
+    notifyListeners();
   }
 
   Future<void> checkModelStatus() async {
@@ -593,6 +630,15 @@ class AppState extends ChangeNotifier {
     await _autoSaveProject();
   }
 
+  Future<void> deleteCurrentProject() async {
+    if (_currentProjectPath != null) {
+      await ProjectService.deleteProject(_currentProjectPath!);
+      _currentProjectPath = null;
+      reset();
+      notifyListeners();
+    }
+  }
+
   @override
   void dispose() {
     WakelockPlus.disable();
@@ -635,10 +681,101 @@ class VideoAnnotatorApp extends StatelessWidget {
   }
 }
 
-// ==================== UI ====================
+// ==================== Main Screen with Navigation ====================
 
 class MainScreen extends StatelessWidget {
   const MainScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppState>();
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final isWide = constraints.maxWidth >= 800;
+
+        if (isWide) {
+          // Wide screen: NavigationRail on the left
+          return Scaffold(
+            body: Row(
+              children: [
+                NavigationRail(
+                  selectedIndex: state.selectedIndex,
+                  onDestinationSelected: state.setSelectedIndex,
+                  labelType: NavigationRailLabelType.all,
+                  leading: const SizedBox(height: 8),
+                  destinations: const [
+                    NavigationRailDestination(
+                      icon: Icon(Icons.home_outlined),
+                      selectedIcon: Icon(Icons.home),
+                      label: Text('主页'),
+                    ),
+                    NavigationRailDestination(
+                      icon: Icon(Icons.folder_outlined),
+                      selectedIcon: Icon(Icons.folder),
+                      label: Text('项目'),
+                    ),
+                    NavigationRailDestination(
+                      icon: Icon(Icons.settings_outlined),
+                      selectedIcon: Icon(Icons.settings),
+                      label: Text('设置'),
+                    ),
+                  ],
+                ),
+                const VerticalDivider(width: 1),
+                Expanded(child: _buildContent(state.selectedIndex)),
+              ],
+            ),
+          );
+        } else {
+          // Narrow screen: BottomNavigationBar
+          return Scaffold(
+            body: _buildContent(state.selectedIndex),
+            bottomNavigationBar: NavigationBar(
+              selectedIndex: state.selectedIndex,
+              onDestinationSelected: state.setSelectedIndex,
+              destinations: const [
+                NavigationDestination(
+                  icon: Icon(Icons.home_outlined),
+                  selectedIcon: Icon(Icons.home),
+                  label: '主页',
+                ),
+                NavigationDestination(
+                  icon: Icon(Icons.folder_outlined),
+                  selectedIcon: Icon(Icons.folder),
+                  label: '项目',
+                ),
+                NavigationDestination(
+                  icon: Icon(Icons.settings_outlined),
+                  selectedIcon: Icon(Icons.settings),
+                  label: '设置',
+                ),
+              ],
+            ),
+          );
+        }
+      },
+    );
+  }
+
+  Widget _buildContent(int index) {
+    switch (index) {
+      case 0:
+        return const _HomePage();
+      case 1:
+        return const _ProjectsPage();
+      case 2:
+        return const _SettingsPage();
+      default:
+        return const _HomePage();
+    }
+  }
+}
+
+// ==================== Home Page ====================
+
+class _HomePage extends StatelessWidget {
+  const _HomePage();
 
   @override
   Widget build(BuildContext context) {
@@ -658,17 +795,7 @@ class MainScreen extends StatelessWidget {
         ),
         centerTitle: true,
         elevation: 0,
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.tune),
-            tooltip: '设置',
-            onPressed: () => showModalBottomSheet(
-              context: context,
-              isScrollControlled: true,
-              builder: (_) => const _SettingsSheet(),
-            ),
-          ),
-        ],
+        automaticallyImplyLeading: false,
       ),
       body: SafeArea(
         child: Column(
@@ -684,178 +811,426 @@ class MainScreen extends StatelessWidget {
   }
 }
 
-// ==================== Settings Sheet ====================
+// ==================== Projects Page ====================
 
-class _SettingsSheet extends StatelessWidget {
-  const _SettingsSheet();
+class _ProjectsPage extends StatefulWidget {
+  const _ProjectsPage();
+
+  @override
+  State<_ProjectsPage> createState() => _ProjectsPageState();
+}
+
+class _ProjectsPageState extends State<_ProjectsPage> {
+  List<String> _projects = [];
+  bool _isLoading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadProjects();
+  }
+
+  Future<void> _loadProjects() async {
+    setState(() => _isLoading = true);
+    final projects = await ProjectService.listProjects();
+    setState(() {
+      _projects = projects;
+      _isLoading = false;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final state = context.watch<AppState>();
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('项目列表'),
+        centerTitle: true,
+        elevation: 0,
+        automaticallyImplyLeading: false,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: _loadProjects,
+            tooltip: '刷新',
+          ),
+        ],
+      ),
+      body: SafeArea(
+        child: _isLoading
+            ? const Center(child: CircularProgressIndicator())
+            : _projects.isEmpty
+            ? Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      Icons.folder_open,
+                      size: 64,
+                      color: theme.colorScheme.onSurfaceVariant.withAlpha(100),
+                    ),
+                    const SizedBox(height: 16),
+                    Text(
+                      '暂无项目',
+                      style: theme.textTheme.titleMedium?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      '在主页标记片段后自动创建项目',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant.withAlpha(
+                          150,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              )
+            : ListView.builder(
+                padding: const EdgeInsets.all(8),
+                itemCount: _projects.length,
+                itemBuilder: (ctx, i) {
+                  final path = _projects[i];
+                  final name = path.split('/').last.replaceAll('.va', '');
+                  final isCurrentProject = state.currentProjectPath == path;
+
+                  return Card(
+                    color: isCurrentProject
+                        ? theme.colorScheme.primaryContainer
+                        : null,
+                    child: ListTile(
+                      leading: Icon(
+                        Icons.video_file,
+                        color: isCurrentProject
+                            ? theme.colorScheme.primary
+                            : theme.colorScheme.onSurfaceVariant,
+                      ),
+                      title: Text(
+                        name,
+                        style: TextStyle(
+                          fontWeight: isCurrentProject
+                              ? FontWeight.bold
+                              : FontWeight.normal,
+                        ),
+                      ),
+                      subtitle: Text(
+                        path,
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (isCurrentProject)
+                            Chip(
+                              label: const Text('当前'),
+                              labelStyle: TextStyle(
+                                fontSize: 10,
+                                color: theme.colorScheme.onPrimaryContainer,
+                              ),
+                              backgroundColor: theme.colorScheme.primary,
+                              padding: EdgeInsets.zero,
+                              visualDensity: VisualDensity.compact,
+                            ),
+                          IconButton(
+                            icon: const Icon(Icons.delete_outline),
+                            onPressed: () => _confirmDelete(context, path),
+                            tooltip: '删除',
+                          ),
+                        ],
+                      ),
+                      onTap: () async {
+                        await state.loadProject(path);
+                        state.setSelectedIndex(0);
+                        if (context.mounted) {
+                          ScaffoldMessenger.of(
+                            context,
+                          ).showSnackBar(SnackBar(content: Text('已打开: $name')));
+                        }
+                      },
+                    ),
+                  );
+                },
+              ),
+      ),
+    );
+  }
+
+  Future<void> _confirmDelete(BuildContext context, String path) async {
+    final name = path.split('/').last.replaceAll('.va', '');
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('确认删除'),
+        content: Text('确定要删除项目 "$name" 吗？此操作不可恢复。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true && context.mounted) {
+      await ProjectService.deleteProject(path);
+      _loadProjects();
+      if (context.mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('已删除: $name')));
+      }
+    }
+  }
+}
+
+// ==================== Settings Page ====================
+
+class _SettingsPage extends StatelessWidget {
+  const _SettingsPage();
 
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
     final theme = Theme.of(context);
 
-    return Container(
-      padding: const EdgeInsets.all(24),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text('设置', style: theme.textTheme.titleLarge),
-              IconButton(
-                onPressed: () => Navigator.pop(context),
-                icon: const Icon(Icons.close),
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('设置'),
+        centerTitle: true,
+        elevation: 0,
+        automaticallyImplyLeading: false,
+      ),
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            // Project management section
+            Text(
+              '项目管理',
+              style: theme.textTheme.titleSmall?.copyWith(
+                color: theme.colorScheme.primary,
               ),
-            ],
-          ),
-          const SizedBox(height: 20),
-
-          // Project management
-          Text(
-            '项目管理',
-            style: theme.textTheme.titleSmall?.copyWith(
-              color: theme.colorScheme.primary,
             ),
-          ),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: () {
-                    state.newProject();
-                    Navigator.pop(context);
-                    ScaffoldMessenger.of(
-                      context,
-                    ).showSnackBar(const SnackBar(content: Text('已创建新项目')));
-                  },
-                  icon: const Icon(Icons.add),
-                  label: const Text('新建项目'),
-                ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: FilledButton.icon(
-                  onPressed: state.clips.isEmpty
-                      ? null
-                      : () {
-                          state.saveProject();
-                          Navigator.pop(context);
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(
-                              content: Text('已保存: ${state.projectName}'),
-                            ),
-                          );
-                        },
-                  icon: const Icon(Icons.save),
-                  label: const Text('保存'),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 24),
-          const Divider(),
-          const SizedBox(height: 16),
-
-          // Model download section
-          Text(
-            '语音转文字模型',
-            style: theme.textTheme.titleSmall?.copyWith(
-              color: theme.colorScheme.primary,
-            ),
-          ),
-          const SizedBox(height: 8),
-          Text('Whisper Base 模型（约 140MB）', style: theme.textTheme.bodySmall),
-          const SizedBox(height: 8),
-
-          if (state.isModelDownloaded) ...[
-            Row(
-              children: [
-                const Icon(Icons.check_circle, color: Colors.green, size: 20),
-                const SizedBox(width: 8),
-                const Expanded(
-                  child: Text('已下载', style: TextStyle(color: Colors.green)),
-                ),
-                TextButton(
-                  onPressed: () async {
-                    await state.deleteModel();
-                  },
-                  child: const Text('删除', style: TextStyle(color: Colors.red)),
-                ),
-              ],
-            ),
-          ] else if (state.isDownloading) ...[
-            Row(
-              children: [
-                Expanded(
-                  child: LinearProgressIndicator(
-                    value: state.downloadProgress,
-                    borderRadius: BorderRadius.circular(4),
+            const SizedBox(height: 12),
+            Card(
+              child: Column(
+                children: [
+                  ListTile(
+                    leading: const Icon(Icons.add),
+                    title: const Text('新建项目'),
+                    subtitle: const Text('创建空白项目'),
+                    onTap: () {
+                      state.newProject();
+                      ScaffoldMessenger.of(
+                        context,
+                      ).showSnackBar(const SnackBar(content: Text('已创建新项目')));
+                    },
                   ),
-                ),
-                const SizedBox(width: 12),
-                Text(
-                  '${(state.downloadProgress * 100).toInt()}%',
-                  style: theme.textTheme.bodySmall,
-                ),
-              ],
+                  const Divider(height: 1),
+                  ListTile(
+                    leading: const Icon(Icons.save),
+                    title: const Text('保存项目'),
+                    subtitle: const Text('保存当前项目'),
+                    enabled: state.clips.isNotEmpty,
+                    onTap: () {
+                      state.saveProject();
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text('已保存: ${state.projectName}')),
+                      );
+                    },
+                  ),
+                  const Divider(height: 1),
+                  ListTile(
+                    leading: const Icon(
+                      Icons.delete_forever,
+                      color: Colors.red,
+                    ),
+                    title: const Text(
+                      '删除当前项目',
+                      style: TextStyle(color: Colors.red),
+                    ),
+                    subtitle: const Text('删除项目文件和相关录音'),
+                    enabled: state.currentProjectPath != null,
+                    onTap: () => _confirmDeleteProject(context, state),
+                  ),
+                ],
+              ),
             ),
-          ] else ...[
-            SizedBox(
-              width: double.infinity,
-              child: FilledButton.icon(
-                onPressed: () => state.downloadModel(),
-                icon: const Icon(Icons.download),
-                label: const Text('下载模型'),
+
+            const SizedBox(height: 24),
+
+            // Model download section
+            Text(
+              '语音转文字模型',
+              style: theme.textTheme.titleSmall?.copyWith(
+                color: theme.colorScheme.primary,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text('Whisper Base 模型（约 140MB）', style: theme.textTheme.bodySmall),
+            const SizedBox(height: 12),
+
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: state.isModelDownloaded
+                    ? Row(
+                        children: [
+                          const Icon(
+                            Icons.check_circle,
+                            color: Colors.green,
+                            size: 20,
+                          ),
+                          const SizedBox(width: 8),
+                          const Expanded(
+                            child: Text(
+                              '已下载',
+                              style: TextStyle(color: Colors.green),
+                            ),
+                          ),
+                          TextButton(
+                            onPressed: () async {
+                              await state.deleteModel();
+                            },
+                            child: const Text(
+                              '删除',
+                              style: TextStyle(color: Colors.red),
+                            ),
+                          ),
+                        ],
+                      )
+                    : state.isDownloading
+                    ? Row(
+                        children: [
+                          Expanded(
+                            child: LinearProgressIndicator(
+                              value: state.downloadProgress,
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Text(
+                            '${(state.downloadProgress * 100).toInt()}%',
+                            style: theme.textTheme.bodySmall,
+                          ),
+                        ],
+                      )
+                    : SizedBox(
+                        width: double.infinity,
+                        child: FilledButton.icon(
+                          onPressed: () => state.downloadModel(),
+                          icon: const Icon(Icons.download),
+                          label: const Text('下载模型'),
+                        ),
+                      ),
+              ),
+            ),
+
+            const SizedBox(height: 24),
+
+            // Time window section
+            Text(
+              '时间窗口',
+              style: theme.textTheme.titleSmall?.copyWith(
+                color: theme.colorScheme.primary,
+              ),
+            ),
+            const SizedBox(height: 12),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  children: [
+                    Text(
+                      '前后 ${state.windowSeconds} 秒（共 ${state.windowSeconds * 2} 秒）',
+                      style: const TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    Slider(
+                      value: state.windowSeconds.toDouble(),
+                      min: 5,
+                      max: 120,
+                      divisions: 23,
+                      label: '${state.windowSeconds}s',
+                      onChanged: (v) {
+                        state.setWindowSeconds(v.round());
+                      },
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+            const SizedBox(height: 24),
+
+            // About section
+            Text(
+              '关于',
+              style: theme.textTheme.titleSmall?.copyWith(
+                color: theme.colorScheme.primary,
+              ),
+            ),
+            const SizedBox(height: 12),
+            Card(
+              child: ListTile(
+                leading: const Icon(Icons.info_outline),
+                title: const Text('视频标注工具'),
+                subtitle: const Text('版本 1.0.0'),
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
 
-          const SizedBox(height: 24),
-          const Divider(),
-          const SizedBox(height: 16),
+  Future<void> _confirmDeleteProject(
+    BuildContext context,
+    AppState state,
+  ) async {
+    if (state.currentProjectPath == null) return;
 
-          // Time window section
-          Text(
-            '时间窗口',
-            style: theme.textTheme.titleSmall?.copyWith(
-              color: theme.colorScheme.primary,
-            ),
+    final name = state.projectName;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('确认删除'),
+        content: Text('确定要删除项目 "$name" 吗？此操作不可恢复。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
           ),
-          const SizedBox(height: 8),
-          StatefulBuilder(
-            builder: (ctx, setState) {
-              int temp = state.windowSeconds;
-              return Column(
-                children: [
-                  Text(
-                    '前后 ${temp} 秒（共 ${temp * 2} 秒）',
-                    style: const TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  Slider(
-                    value: temp.toDouble(),
-                    min: 5,
-                    max: 120,
-                    divisions: 23,
-                    label: '${temp}s',
-                    onChanged: (v) {
-                      setState(() => temp = v.round());
-                      state.setWindowSeconds(temp);
-                    },
-                  ),
-                ],
-              );
-            },
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除', style: TextStyle(color: Colors.red)),
           ),
-          const SizedBox(height: 16),
         ],
       ),
     );
+
+    if (confirmed == true) {
+      await state.deleteCurrentProject();
+      if (context.mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('已删除: $name')));
+      }
+    }
   }
 }
 
@@ -908,7 +1283,7 @@ class _TimerSection extends StatelessWidget {
   }
 }
 
-// ==================== Slide to Toggle ====================
+// ==================== Toggle Button ====================
 
 class _ClickToggleButton extends StatelessWidget {
   @override
