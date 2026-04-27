@@ -293,7 +293,7 @@ class WhisperService {
     return file.existsSync();
   }
 
-  static Future<void> downloadModel(
+  static Future<bool> downloadModel(
     WhisperModelSize size, {
     void Function(double progress)? onProgress,
     void Function(String error)? onError,
@@ -301,7 +301,7 @@ class WhisperService {
     final dir = await _modelDir;
     final file = File('$dir/${size.fileName}');
 
-    if (file.existsSync()) return;
+    if (file.existsSync()) return true;
 
     try {
       final uri = Uri.parse('$_downloadHost/${size.fileName}');
@@ -310,7 +310,7 @@ class WhisperService {
 
       if (response.statusCode != 200) {
         onError?.call('下载失败: HTTP ${response.statusCode}');
-        return;
+        return false;
       }
 
       final contentLength = response.contentLength;
@@ -325,8 +325,13 @@ class WhisperService {
         }
       }
       await raf.close();
+      return true;
     } catch (e) {
+      if (file.existsSync()) {
+        file.deleteSync();
+      }
       onError?.call('下载失败: $e');
+      return false;
     }
   }
 
@@ -344,9 +349,19 @@ class WhisperService {
     String? apiKey,
     String? apiEndpoint,
   }) async {
+    final normalizedApiKey = apiKey?.trim();
+    final normalizedApiEndpoint = apiEndpoint?.trim();
+
     // If API mode is configured, use API
-    if (apiKey != null && apiKey.isNotEmpty && apiEndpoint != null) {
-      return _transcribeViaApi(audioPath, apiKey, apiEndpoint);
+    if (normalizedApiKey != null &&
+        normalizedApiKey.isNotEmpty &&
+        normalizedApiEndpoint != null &&
+        normalizedApiEndpoint.isNotEmpty) {
+      return _transcribeViaApi(
+        audioPath,
+        normalizedApiKey,
+        normalizedApiEndpoint,
+      );
     }
 
     // Otherwise use local model
@@ -398,21 +413,42 @@ class WhisperService {
   ) async {
     try {
       final file = File(audioPath);
-      final bytes = await file.readAsBytes();
-      final base64Audio = base64Encode(bytes);
+      if (!file.existsSync()) {
+        return null;
+      }
 
       final uri = Uri.parse(apiEndpoint);
       final request = await HttpClient().postUrl(uri);
+      final boundary =
+          'video_annotator_${DateTime.now().microsecondsSinceEpoch}';
+      final filename = file.uri.pathSegments.isNotEmpty
+          ? file.uri.pathSegments.last
+          : 'audio.wav';
 
-      request.headers.set('Content-Type', 'application/json');
-      request.headers.set('Authorization', 'Bearer $apiKey');
+      request.headers.set(
+        HttpHeaders.contentTypeHeader,
+        'multipart/form-data; boundary=$boundary',
+      );
+      request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $apiKey');
 
-      final body = jsonEncode({
-        'model': 'whisper-1',
-        'audio': base64Audio,
-      });
+      void writeField(String name, String value) {
+        request.write('--$boundary\r\n');
+        request.write(
+          'Content-Disposition: form-data; name="$name"\r\n\r\n',
+        );
+        request.write(value);
+        request.write('\r\n');
+      }
 
-      request.write(body);
+      writeField('model', 'whisper-1');
+      writeField('language', 'zh');
+      request.write('--$boundary\r\n');
+      request.write(
+        'Content-Disposition: form-data; name="file"; filename="$filename"\r\n',
+      );
+      request.write('Content-Type: audio/wav\r\n\r\n');
+      await request.addStream(file.openRead());
+      request.write('\r\n--$boundary--\r\n');
 
       final response = await request.close();
       final responseBody = await response.transform(utf8.decoder).join();
@@ -488,7 +524,11 @@ class AppState extends ChangeNotifier {
   bool get useApiMode => _useApiMode;
   String? get apiKey => _apiKey;
   String? get apiEndpoint => _apiEndpoint;
-  bool get isModelAvailable => _isModelDownloaded || _useApiMode;
+  bool get isApiConfigured =>
+      _useApiMode &&
+      (_apiKey?.trim().isNotEmpty ?? false) &&
+      (_apiEndpoint?.trim().isNotEmpty ?? false);
+  bool get isModelAvailable => _isModelDownloaded || isApiConfigured;
   String? get transcribingClipId => _transcribingClipId;
 
   String get formattedTime {
@@ -524,14 +564,16 @@ class AppState extends ChangeNotifier {
     notifyListeners();
 
     try {
-      await WhisperService.downloadModel(
+      final downloaded = await WhisperService.downloadModel(
         _selectedModelSize,
         onProgress: (p) {
           _downloadProgress = p;
           notifyListeners();
         },
       );
-      _isModelDownloaded = true;
+      _isModelDownloaded =
+          downloaded &&
+          await WhisperService.isModelDownloaded(_selectedModelSize);
     } catch (e) {
       // Download failed silently
     } finally {
@@ -558,12 +600,12 @@ class AppState extends ChangeNotifier {
   }
 
   void setApiKey(String? value) {
-    _apiKey = value;
+    _apiKey = value?.trim();
     notifyListeners();
   }
 
   void setApiEndpoint(String? value) {
-    _apiEndpoint = value;
+    _apiEndpoint = value?.trim();
     notifyListeners();
   }
 
@@ -626,7 +668,7 @@ class AppState extends ChangeNotifier {
     _recordingStartMs = _elapsedMs; // Save elapsed at button press
 
     // Check if we can do recording + transcription
-    final canRecord = _isModelDownloaded || _useApiMode;
+    final canRecord = _isModelDownloaded || isApiConfigured;
 
     if (!canRecord) {
       // No-model mode: add clip immediately without audio
@@ -1666,8 +1708,10 @@ class _SettingsPage extends StatelessWidget {
                           const SizedBox(width: 8),
                           Expanded(
                             child: Text(
-                              state.useApiMode || state.isModelDownloaded
+                              state.isModelDownloaded || state.isApiConfigured
                                   ? '支持录音标注'
+                                  : state.useApiMode
+                                  ? '请先填写有效的 API Key 和 Endpoint'
                                   : '无模型/无API，仅标记时间点',
                               style: theme.textTheme.bodySmall?.copyWith(
                                 color: theme.colorScheme.onSurfaceVariant,
