@@ -37,7 +37,11 @@ jobs:
             exit 1
           fi
           SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-          yes | head -n 100 | "$SDKMANAGER" --licenses
+          if [ ! -x "$SDKMANAGER" ]; then
+            echo "sdkmanager not found at $SDKMANAGER" >&2
+            exit 1
+          fi
+          yes 2>/dev/null | "$SDKMANAGER" --licenses || true
           "$SDKMANAGER" "ndk;28.2.13676358" "ndk;27.0.11902837"
 
       - name: Get dependencies
