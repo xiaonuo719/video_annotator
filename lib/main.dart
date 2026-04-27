@@ -796,17 +796,65 @@ class _HomePage extends StatelessWidget {
         centerTitle: true,
         elevation: 0,
         automaticallyImplyLeading: false,
-        actions: [_ToggleButton(), const SizedBox(width: 8)],
       ),
       body: SafeArea(
         child: Column(
           children: [
-            Expanded(flex: 2, child: _TimerSection()),
+            _CompactTimerHeader(),
             const Divider(height: 1),
-            Expanded(flex: 3, child: _ClipListSection()),
+            Expanded(child: _ClipListSection()),
+            _MarkButtonsRow(),
             _BottomActionsSection(),
           ],
         ),
+      ),
+    );
+  }
+}
+
+// ==================== Compact Timer Header ====================
+
+class _CompactTimerHeader extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppState>();
+    final theme = Theme.of(context);
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: Row(
+        children: [
+          IconButton(
+            onPressed: () => state.toggle(),
+            icon: Icon(
+              state.isRunning ? Icons.stop : Icons.play_arrow,
+              color: state.isRunning ? Colors.red : Colors.green,
+            ),
+            style: IconButton.styleFrom(
+              backgroundColor: (state.isRunning ? Colors.red : Colors.green)
+                  .withAlpha(26),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Text(
+            state.formattedTime,
+            style: TextStyle(
+              fontSize: 36,
+              fontWeight: FontWeight.w300,
+              fontFamily: 'monospace',
+              color: state.isRunning
+                  ? theme.colorScheme.primary
+                  : theme.colorScheme.onSurface,
+            ),
+          ),
+          const Spacer(),
+          Text(
+            '${state.clips.length} 个片段',
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -948,12 +996,17 @@ class _ProjectsPageState extends State<_ProjectsPage> {
                         ],
                       ),
                       onTap: () async {
-                        await state.loadProject(path);
-                        state.setSelectedIndex(0);
-                        if (context.mounted) {
-                          ScaffoldMessenger.of(
+                        final project = await ProjectService.loadProject(path);
+                        if (project != null && context.mounted) {
+                          Navigator.push(
                             context,
-                          ).showSnackBar(SnackBar(content: Text('已打开: $name')));
+                            MaterialPageRoute(
+                              builder: (_) => _ProjectViewerPage(
+                                projectPath: path,
+                                project: project,
+                              ),
+                            ),
+                          );
                         }
                       },
                     ),
@@ -1235,149 +1288,342 @@ class _SettingsPage extends StatelessWidget {
   }
 }
 
-// ==================== Timer Section ====================
+// ==================== Project Viewer Page (Read-only) ====================
 
-class _TimerSection extends StatelessWidget {
+class _ProjectViewerPage extends StatelessWidget {
+  final String projectPath;
+  final Project project;
+
+  const _ProjectViewerPage({required this.projectPath, required this.project});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final name = projectPath.split('/').last.replaceAll('.va', '');
+
+    return Scaffold(
+      appBar: AppBar(title: Text(name), centerTitle: true, elevation: 0),
+      body: SafeArea(
+        child: Column(
+          children: [
+            // Project info header
+            Container(
+              padding: const EdgeInsets.all(16),
+              color: theme.colorScheme.surfaceContainerHighest.withAlpha(77),
+              child: Row(
+                children: [
+                  Icon(
+                    Icons.video_file,
+                    size: 40,
+                    color: theme.colorScheme.primary,
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          name,
+                          style: theme.textTheme.titleMedium?.copyWith(
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          '创建: ${_formatDate(project.createdAt)}',
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                        Text(
+                          '片段数: ${project.clips.length}',
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 1),
+            // Clip list
+            Expanded(
+              child: project.clips.isEmpty
+                  ? Center(
+                      child: Text(
+                        '无片段',
+                        style: theme.textTheme.bodyLarge?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                    )
+                  : ListView.builder(
+                      padding: const EdgeInsets.all(8),
+                      itemCount: project.clips.length,
+                      itemBuilder: (ctx, i) {
+                        final clip = project.clips[i];
+                        return _ViewerClipItem(clip: clip);
+                      },
+                    ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _formatDate(DateTime dt) {
+    return '${dt.year}-${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')} '
+        '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+  }
+}
+
+class _ViewerClipItem extends StatelessWidget {
+  final ClipSegment clip;
+
+  const _ViewerClipItem({required this.clip});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isHighlight = clip.type == '亮点';
+    final isTakeover = clip.type == '接管';
+    final bgColor = isTakeover
+        ? const Color(0xFFE3F2FD)
+        : isHighlight
+        ? const Color(0xFFFFE082).withAlpha(51)
+        : const Color(0xFFEF9A9A).withAlpha(51);
+    final labelColor = isTakeover
+        ? const Color(0xFF1976D2)
+        : isHighlight
+        ? const Color(0xFFFF8F00)
+        : const Color(0xFFD32F2F);
+
+    return Card(
+      color: bgColor,
+      margin: const EdgeInsets.symmetric(vertical: 4),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      elevation: 0,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Container(
+                  width: 4,
+                  height: 32,
+                  decoration: BoxDecoration(
+                    color: labelColor,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        clip.timeRange,
+                        style: const TextStyle(
+                          fontFamily: 'monospace',
+                          fontSize: 16,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Row(
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 2,
+                            ),
+                            decoration: BoxDecoration(
+                              color: labelColor.withAlpha(26),
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: Text(
+                              clip.type,
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.bold,
+                                color: labelColor,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Text(
+                            clip.durationStr,
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Icon(
+                            Icons.mic,
+                            size: 14,
+                            color: clip.audioPath != null
+                                ? theme.colorScheme.primary
+                                : theme.colorScheme.onSurfaceVariant.withAlpha(
+                                    77,
+                                  ),
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            _formatTime(clip.wallClockTime),
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            if (clip.remark != null && clip.remark!.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.surface,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Icon(
+                      Icons.format_quote,
+                      size: 16,
+                      color: theme.colorScheme.primary,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        clip.remark!,
+                        style: TextStyle(
+                          fontSize: 13,
+                          color: theme.colorScheme.onSurface,
+                          fontStyle: FontStyle.italic,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _formatTime(DateTime dt) {
+    return '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}:${dt.second.toString().padLeft(2, '0')}';
+  }
+}
+
+// ==================== Mark Buttons Row ====================
+
+class _MarkButtonsRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
-    final theme = Theme.of(context);
 
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 20),
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+      child: Row(
         children: [
-          Text(
-            state.formattedTime,
-            style: TextStyle(
-              fontSize: 88,
-              fontWeight: FontWeight.w200,
-              fontFamily: 'monospace',
-              letterSpacing: 4,
-              color: state.isRunning
-                  ? theme.colorScheme.primary
-                  : theme.colorScheme.onSurface.withAlpha(180),
+          Expanded(
+            child: _CompactMarkButton(
+              type: '接管',
+              color: const Color(0xFF1976D2),
+              textColor: Colors.white,
+              isRecording: state.isRecording && state.recordingType == '接管',
+              recordingSecondsLeft: state.recordingSecondsLeft,
+              onTap: () {
+                if (!state.isModelDownloaded) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('请先在设置中下载语音模型'),
+                      duration: Duration(seconds: 2),
+                    ),
+                  );
+                  return;
+                }
+                if (!state.isRecording) {
+                  state.onMarkButtonPressed('接管');
+                }
+              },
+              onCancel: () => state.cancelRecording(),
             ),
           ),
-          const SizedBox(height: 8),
-          Text(
-            '已标记 ${state.clips.length} 个片段 · ±${state.windowSeconds}s',
-            style: theme.textTheme.bodyMedium?.copyWith(
-              color: theme.colorScheme.onSurfaceVariant,
+          const SizedBox(width: 8),
+          Expanded(
+            child: _CompactMarkButton(
+              type: '亮点',
+              color: const Color(0xFFFFA000),
+              textColor: Colors.black,
+              isRecording: state.isRecording && state.recordingType == '亮点',
+              recordingSecondsLeft: state.recordingSecondsLeft,
+              onTap: () {
+                if (!state.isModelDownloaded) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('请先在设置中下载语音模型'),
+                      duration: Duration(seconds: 2),
+                    ),
+                  );
+                  return;
+                }
+                if (!state.isRecording) {
+                  state.onMarkButtonPressed('亮点');
+                }
+              },
+              onCancel: () => state.cancelRecording(),
             ),
           ),
-          const SizedBox(height: 24),
-          _MarkButtonsColumn(),
+          const SizedBox(width: 8),
+          Expanded(
+            child: _CompactMarkButton(
+              type: '不足',
+              color: const Color(0xFFD32F2F),
+              textColor: Colors.white,
+              isRecording: state.isRecording && state.recordingType == '不足',
+              recordingSecondsLeft: state.recordingSecondsLeft,
+              onTap: () {
+                if (!state.isModelDownloaded) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('请先在设置中下载语音模型'),
+                      duration: Duration(seconds: 2),
+                    ),
+                  );
+                  return;
+                }
+                if (!state.isRecording) {
+                  state.onMarkButtonPressed('不足');
+                }
+              },
+              onCancel: () => state.cancelRecording(),
+            ),
+          ),
         ],
       ),
     );
   }
 }
 
-// ==================== Toggle Button (AppBar) ====================
+// ==================== Compact Mark Button ====================
 
-class _ToggleButton extends StatelessWidget {
-  @override
-  Widget build(BuildContext context) {
-    final state = context.watch<AppState>();
-    final isRunning = state.isRunning;
-    final color = isRunning ? const Color(0xFFD32F2F) : Colors.green;
-    final icon = isRunning ? Icons.stop : Icons.play_arrow;
-
-    return IconButton(
-      onPressed: () => state.toggle(),
-      icon: Icon(icon, color: color),
-      tooltip: isRunning ? '停止' : '开始',
-      style: IconButton.styleFrom(backgroundColor: color.withAlpha(26)),
-    );
-  }
-}
-
-// ==================== Mark Buttons Column ====================
-
-class _MarkButtonsColumn extends StatelessWidget {
-  @override
-  Widget build(BuildContext context) {
-    final state = context.watch<AppState>();
-
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        _LargeMarkButton(
-          type: '接管',
-          color: const Color(0xFF1976D2),
-          textColor: Colors.white,
-          isRecording: state.isRecording && state.recordingType == '接管',
-          recordingSecondsLeft: state.recordingSecondsLeft,
-          onTap: () {
-            if (!state.isModelDownloaded) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text('请先在设置中下载语音模型'),
-                  duration: Duration(seconds: 2),
-                ),
-              );
-              return;
-            }
-            if (!state.isRecording) {
-              state.onMarkButtonPressed('接管');
-            }
-          },
-          onCancel: () => state.cancelRecording(),
-        ),
-        const SizedBox(height: 16),
-        _LargeMarkButton(
-          type: '亮点',
-          color: const Color(0xFFFFA000),
-          textColor: Colors.black,
-          isRecording: state.isRecording && state.recordingType == '亮点',
-          recordingSecondsLeft: state.recordingSecondsLeft,
-          onTap: () {
-            if (!state.isModelDownloaded) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text('请先在设置中下载语音模型'),
-                  duration: Duration(seconds: 2),
-                ),
-              );
-              return;
-            }
-            if (!state.isRecording) {
-              state.onMarkButtonPressed('亮点');
-            }
-          },
-          onCancel: () => state.cancelRecording(),
-        ),
-        const SizedBox(height: 16),
-        _LargeMarkButton(
-          type: '不足',
-          color: const Color(0xFFD32F2F),
-          textColor: Colors.white,
-          isRecording: state.isRecording && state.recordingType == '不足',
-          recordingSecondsLeft: state.recordingSecondsLeft,
-          onTap: () {
-            if (!state.isModelDownloaded) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text('请先在设置中下载语音模型'),
-                  duration: Duration(seconds: 2),
-                ),
-              );
-              return;
-            }
-            if (!state.isRecording) {
-              state.onMarkButtonPressed('不足');
-            }
-          },
-          onCancel: () => state.cancelRecording(),
-        ),
-      ],
-    );
-  }
-}
-
-class _LargeMarkButton extends StatefulWidget {
+class _CompactMarkButton extends StatefulWidget {
   final String type;
   final Color color;
   final Color textColor;
@@ -1386,7 +1632,7 @@ class _LargeMarkButton extends StatefulWidget {
   final VoidCallback onTap;
   final VoidCallback onCancel;
 
-  const _LargeMarkButton({
+  const _CompactMarkButton({
     required this.type,
     required this.color,
     required this.textColor,
@@ -1397,15 +1643,15 @@ class _LargeMarkButton extends StatefulWidget {
   });
 
   @override
-  State<_LargeMarkButton> createState() => _LargeMarkButtonState();
+  State<_CompactMarkButton> createState() => _CompactMarkButtonState();
 }
 
-class _LargeMarkButtonState extends State<_LargeMarkButton> {
+class _CompactMarkButtonState extends State<_CompactMarkButton> {
   bool _flash = false;
 
   void _triggerFlash() {
     setState(() => _flash = true);
-    Future.delayed(const Duration(milliseconds: 200), () {
+    Future.delayed(const Duration(milliseconds: 100), () {
       if (mounted) setState(() => _flash = false);
     });
   }
@@ -1424,11 +1670,10 @@ class _LargeMarkButtonState extends State<_LargeMarkButton> {
         }
       },
       child: AnimatedContainer(
-        duration: const Duration(milliseconds: 150),
-        width: double.infinity,
-        height: 80,
+        duration: const Duration(milliseconds: 100),
+        height: 56,
         decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(20),
+          borderRadius: BorderRadius.circular(12),
           color: isThisRecording
               ? widget.color.withAlpha(77)
               : _flash
@@ -1436,9 +1681,8 @@ class _LargeMarkButtonState extends State<_LargeMarkButton> {
               : widget.color.withAlpha(200),
           boxShadow: [
             BoxShadow(
-              color: widget.color.withAlpha(_flash ? 150 : 77),
-              blurRadius: _flash ? 20 : 10,
-              spreadRadius: _flash ? 2 : 0,
+              color: widget.color.withAlpha(_flash ? 150 : 51),
+              blurRadius: _flash ? 12 : 4,
             ),
           ],
         ),
@@ -1448,19 +1692,19 @@ class _LargeMarkButtonState extends State<_LargeMarkButton> {
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
                     SizedBox(
-                      width: 20,
-                      height: 20,
+                      width: 16,
+                      height: 16,
                       child: CircularProgressIndicator(
                         strokeWidth: 2,
                         value: widget.recordingSecondsLeft / 10,
                         color: widget.textColor,
                       ),
                     ),
-                    const SizedBox(width: 12),
+                    const SizedBox(width: 8),
                     Text(
-                      '${widget.recordingSecondsLeft}s - 点击取消',
+                      '${widget.recordingSecondsLeft}s',
                       style: TextStyle(
-                        fontSize: 18,
+                        fontSize: 16,
                         fontWeight: FontWeight.bold,
                         color: widget.textColor,
                       ),
@@ -1470,7 +1714,7 @@ class _LargeMarkButtonState extends State<_LargeMarkButton> {
               : Text(
                   widget.type,
                   style: TextStyle(
-                    fontSize: 28,
+                    fontSize: 18,
                     fontWeight: FontWeight.bold,
                     color: widget.textColor,
                   ),
@@ -1507,7 +1751,7 @@ class _ClipListSection extends StatelessWidget {
               ),
             ),
             Text(
-              '滑动上方按钮开始标注',
+              '点击下方按钮开始标注',
               style: theme.textTheme.bodySmall?.copyWith(
                 color: theme.colorScheme.onSurfaceVariant.withAlpha(150),
               ),
@@ -1538,10 +1782,15 @@ class _ClipItem extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final isHighlight = clip.type == '亮点';
-    final bgColor = isHighlight
+    final isTakeover = clip.type == '接管';
+    final bgColor = isTakeover
+        ? const Color(0xFFE3F2FD)
+        : isHighlight
         ? const Color(0xFFFFE082).withAlpha(51)
         : const Color(0xFFEF9A9A).withAlpha(51);
-    final labelColor = isHighlight
+    final labelColor = isTakeover
+        ? const Color(0xFF1976D2)
+        : isHighlight
         ? const Color(0xFFFF8F00)
         : const Color(0xFFD32F2F);
 
@@ -1578,15 +1827,6 @@ class _ClipItem extends StatelessWidget {
                   const SizedBox(height: 2),
                   Row(
                     children: [
-                      Text(
-                        '${clip.type} #${clip.index}',
-                        style: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
-                          color: labelColor,
-                        ),
-                      ),
-                      const SizedBox(width: 8),
                       Container(
                         padding: const EdgeInsets.symmetric(
                           horizontal: 6,
@@ -1597,8 +1837,20 @@ class _ClipItem extends StatelessWidget {
                           borderRadius: BorderRadius.circular(4),
                         ),
                         child: Text(
-                          clip.durationStr,
-                          style: TextStyle(fontSize: 11, color: labelColor),
+                          clip.type,
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.bold,
+                            color: labelColor,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Text(
+                        clip.durationStr,
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: theme.colorScheme.onSurfaceVariant,
                         ),
                       ),
                       if (clip.audioPath != null) ...[
