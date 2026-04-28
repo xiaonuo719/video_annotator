@@ -29,7 +29,7 @@ class MainActivity : FlutterActivity() {
         )
         hidPlugin.setChannel(hidChannel)
         hidChannel.setMethodCallHandler(hidPlugin)
-        hidPlugin.isSupported() // initialise adapter reference
+        hidPlugin.isSupported() // Populates the BluetoothAdapter reference needed for later operations.
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {

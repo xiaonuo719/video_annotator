@@ -649,7 +649,6 @@ class AppState extends ChangeNotifier {
   Future<void> checkModelStatus() async {
     _isModelDownloaded = await WhisperService.isModelDownloaded(_selectedModelSize);
     await ensureStoragePermission();
-    _btHidSupported = await BluetoothHidService.isSupported();
     notifyListeners();
   }
 
@@ -683,7 +682,9 @@ class AppState extends ChangeNotifier {
     if (_btHidEnabled && _btHidConnected) {
       try {
         await BluetoothHidService.sendVolumeUp();
-      } catch (_) {}
+      } catch (e) {
+        debugPrint('BluetoothHidService.sendVolumeUp failed: $e');
+      }
     }
   }
 

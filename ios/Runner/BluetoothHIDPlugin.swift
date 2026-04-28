@@ -12,7 +12,7 @@ import Flutter
 
 @objc class BluetoothHIDPlugin: NSObject, FlutterPlugin, CBPeripheralManagerDelegate {
 
-    // MARK: – Constants
+    // MARK: — Constants
 
     static let channelName = "video_annotator/bluetooth_hid"
 
@@ -49,7 +49,7 @@ import Flutter
         0xC0,               // End Collection
     ]
 
-    // MARK: – State
+    // MARK: — State
 
     private var peripheralManager: CBPeripheralManager?
     private var inputReportCharacteristic: CBMutableCharacteristic?
@@ -58,7 +58,7 @@ import Flutter
 
     private var channel: FlutterMethodChannel?
 
-    // MARK: – FlutterPlugin registration
+    // MARK: — FlutterPlugin registration
 
     static func register(with registrar: FlutterPluginRegistrar) {
         let ch = FlutterMethodChannel(
@@ -70,7 +70,7 @@ import Flutter
         registrar.addMethodCallDelegate(instance, channel: ch)
     }
 
-    // MARK: – FlutterPlugin method handler
+    // MARK: — FlutterPlugin method handler
 
     func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         switch call.method {
@@ -97,7 +97,7 @@ import Flutter
         }
     }
 
-    // MARK: – Advertising
+    // MARK: — Advertising
 
     private func startAdvertising(result: @escaping FlutterResult) {
         if peripheralManager == nil {
@@ -118,7 +118,7 @@ import Flutter
         result(nil)
     }
 
-    // MARK: – Key report
+    // MARK: — Key report
 
     private func sendKey(bit: UInt8, result: @escaping FlutterResult) {
         guard let central = subscribedCentral,
@@ -138,7 +138,7 @@ import Flutter
         result(nil)
     }
 
-    // MARK: – CBPeripheralManagerDelegate
+    // MARK: — CBPeripheralManagerDelegate
 
     func peripheralManagerDidUpdateState(_ peripheral: CBPeripheralManager) {
         guard peripheral.state == .poweredOn, isAdvertising else { return }
@@ -263,7 +263,7 @@ import Flutter
         }
     }
 
-    // MARK: – Helpers
+    // MARK: — Helpers
 
     private func notifyConnectionChanged(connected: Bool) {
         DispatchQueue.main.async {
