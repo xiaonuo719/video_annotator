@@ -18,16 +18,11 @@ class MainActivity : FlutterActivity() {
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (event.action == KeyEvent.ACTION_DOWN) {
             when (event.keyCode) {
-                KeyEvent.KEYCODE_VOLUME_UP -> {
-                    channel?.invokeMethod("volumeUp", null)
-                    return true
-                }
-                KeyEvent.KEYCODE_VOLUME_DOWN -> {
-                    channel?.invokeMethod("volumeDown", null)
-                    return true
-                }
+                KeyEvent.KEYCODE_VOLUME_UP -> channel?.invokeMethod("volumeUp", null)
+                KeyEvent.KEYCODE_VOLUME_DOWN -> channel?.invokeMethod("volumeDown", null)
             }
         }
+        // Always pass through to super so system volume control still works.
         return super.dispatchKeyEvent(event)
     }
 }

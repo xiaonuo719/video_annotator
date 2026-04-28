@@ -625,6 +625,8 @@ class AppState extends ChangeNotifier {
 
   void setupVolumeButtons() {
     _volumeChannel.setMethodCallHandler((call) async {
+      // Ignore volume events when the session is not active or a recording is
+      // already in progress to prevent accidental duplicate marks.
       if (!_isRunning || _isRecording) return;
       switch (call.method) {
         case 'volumeUp':
@@ -1629,15 +1631,20 @@ class _SettingsPage extends StatefulWidget {
 }
 
 class _SettingsPageState extends State<_SettingsPage> {
-  late TextEditingController _apiKeyController;
-  late TextEditingController _apiEndpointController;
+  TextEditingController _apiKeyController = TextEditingController();
+  TextEditingController _apiEndpointController = TextEditingController();
+
+  bool _initialized = false;
 
   @override
-  void initState() {
-    super.initState();
-    final state = context.read<AppState>();
-    _apiKeyController = TextEditingController(text: state.apiKey ?? '');
-    _apiEndpointController = TextEditingController(text: state.apiEndpoint ?? '');
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (!_initialized) {
+      _initialized = true;
+      final state = Provider.of<AppState>(context, listen: false);
+      _apiKeyController = TextEditingController(text: state.apiKey ?? '');
+      _apiEndpointController = TextEditingController(text: state.apiEndpoint ?? '');
+    }
   }
 
   @override
