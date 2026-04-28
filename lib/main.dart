@@ -2,12 +2,14 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
 import 'package:record/record.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:whisper_flutter_new/whisper_flutter_new.dart';
 import 'package:uuid/uuid.dart';
@@ -491,6 +493,16 @@ class WhisperService {
 
 // ==================== State ====================
 
+// MethodChannel for volume button events from native Android
+const _volumeChannel = MethodChannel('video_annotator/volume_buttons');
+
+// SharedPreferences keys
+const _prefWindowSeconds = 'window_seconds';
+const _prefModelSize = 'model_size';
+const _prefUseApiMode = 'use_api_mode';
+const _prefApiKey = 'api_key';
+const _prefApiEndpoint = 'api_endpoint';
+
 class AppState extends ChangeNotifier {
   bool _isRunning = false;
   int _elapsedMs = 0;
@@ -522,6 +534,7 @@ class AppState extends ChangeNotifier {
 
   // Project state
   String? _currentProjectPath;
+  DateTime? _projectCreatedAt;
   bool _isDirty = false;
 
   // Transcription state
@@ -582,6 +595,48 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> loadSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    _windowSeconds = prefs.getInt(_prefWindowSeconds) ?? 30;
+    final modelIndex = prefs.getInt(_prefModelSize) ?? WhisperModelSize.base.index;
+    _selectedModelSize = WhisperModelSize.values[modelIndex.clamp(0, WhisperModelSize.values.length - 1)];
+    _useApiMode = prefs.getBool(_prefUseApiMode) ?? false;
+    _apiKey = prefs.getString(_prefApiKey);
+    _apiEndpoint = prefs.getString(_prefApiEndpoint);
+    notifyListeners();
+  }
+
+  Future<void> _saveSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_prefWindowSeconds, _windowSeconds);
+    await prefs.setInt(_prefModelSize, _selectedModelSize.index);
+    await prefs.setBool(_prefUseApiMode, _useApiMode);
+    if (_apiKey != null) {
+      await prefs.setString(_prefApiKey, _apiKey!);
+    } else {
+      await prefs.remove(_prefApiKey);
+    }
+    if (_apiEndpoint != null) {
+      await prefs.setString(_prefApiEndpoint, _apiEndpoint!);
+    } else {
+      await prefs.remove(_prefApiEndpoint);
+    }
+  }
+
+  void setupVolumeButtons() {
+    _volumeChannel.setMethodCallHandler((call) async {
+      if (!_isRunning || _isRecording) return;
+      switch (call.method) {
+        case 'volumeUp':
+          onMarkButtonPressed('亮点');
+          break;
+        case 'volumeDown':
+          onMarkButtonPressed('不足');
+          break;
+      }
+    });
+  }
+
   Future<void> downloadModel() async {
     if (_isDownloading || _isModelDownloaded) return;
     _isDownloading = true;
@@ -616,26 +671,31 @@ class AppState extends ChangeNotifier {
   void setSelectedModelSize(WhisperModelSize size) {
     if (_selectedModelSize == size) return;
     _selectedModelSize = size;
+    _saveSettings();
     checkModelStatus();
   }
 
   void setUseApiMode(bool value) {
     _useApiMode = value;
+    _saveSettings();
     notifyListeners();
   }
 
   void setApiKey(String? value) {
     _apiKey = value?.trim();
+    _saveSettings();
     notifyListeners();
   }
 
   void setApiEndpoint(String? value) {
     _apiEndpoint = value?.trim();
+    _saveSettings();
     notifyListeners();
   }
 
   void setWindowSeconds(int seconds) {
     _windowSeconds = seconds.clamp(5, 120);
+    _saveSettings();
     notifyListeners();
   }
 
@@ -918,7 +978,7 @@ class AppState extends ChangeNotifier {
     if (_currentProjectPath == null) return;
     final project = Project(
       name: projectName,
-      createdAt: DateTime.now(),
+      createdAt: _projectCreatedAt ?? DateTime.now(),
       updatedAt: DateTime.now(),
       clips: _clips,
     );
@@ -953,6 +1013,7 @@ class AppState extends ChangeNotifier {
   Future<void> newProject() async {
     final projectPath = await ProjectService.generateProjectPath();
     _currentProjectPath = projectPath;
+    _projectCreatedAt = DateTime.now();
     _isDirty = false;
     reset();
     notifyListeners();
@@ -963,6 +1024,7 @@ class AppState extends ChangeNotifier {
     if (project == null) return;
 
     _currentProjectPath = projectPath;
+    _projectCreatedAt = project.createdAt;
     _clips.clear();
     _clips.addAll(project.clips);
 
@@ -992,6 +1054,7 @@ class AppState extends ChangeNotifier {
     if (_currentProjectPath != null) {
       await ProjectService.deleteProject(_currentProjectPath!);
       _currentProjectPath = null;
+      _projectCreatedAt = null;
       reset();
       notifyListeners();
     }
@@ -1014,7 +1077,12 @@ class VideoAnnotatorApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return ChangeNotifierProvider(
-      create: (_) => AppState()..checkModelStatus(),
+      create: (_) {
+        final state = AppState();
+        state.loadSettings().then((_) => state.checkModelStatus());
+        state.setupVolumeButtons();
+        return state;
+      },
       child: MaterialApp(
         title: '视频标注工具',
         debugShowCheckedModeBanner: false,
@@ -1553,8 +1621,31 @@ class _ModeChip extends StatelessWidget {
 
 // ==================== Settings Page ====================
 
-class _SettingsPage extends StatelessWidget {
+class _SettingsPage extends StatefulWidget {
   const _SettingsPage();
+
+  @override
+  State<_SettingsPage> createState() => _SettingsPageState();
+}
+
+class _SettingsPageState extends State<_SettingsPage> {
+  late TextEditingController _apiKeyController;
+  late TextEditingController _apiEndpointController;
+
+  @override
+  void initState() {
+    super.initState();
+    final state = context.read<AppState>();
+    _apiKeyController = TextEditingController(text: state.apiKey ?? '');
+    _apiEndpointController = TextEditingController(text: state.apiEndpoint ?? '');
+  }
+
+  @override
+  void dispose() {
+    _apiKeyController.dispose();
+    _apiEndpointController.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1737,6 +1828,7 @@ class _SettingsPage extends StatelessWidget {
                     ] else ...[
                       // API configuration
                       TextField(
+                        controller: _apiKeyController,
                         decoration: const InputDecoration(
                           labelText: 'API Key',
                           hintText: 'sk-...',
@@ -1747,6 +1839,7 @@ class _SettingsPage extends StatelessWidget {
                       ),
                       const SizedBox(height: 12),
                       TextField(
+                        controller: _apiEndpointController,
                         decoration: const InputDecoration(
                           labelText: 'API Endpoint',
                           hintText: 'https://api.openai.com/v1/audio/transcriptions',
@@ -1845,6 +1938,17 @@ class _SettingsPage extends StatelessWidget {
                 leading: const Icon(Icons.info_outline),
                 title: const Text('视频标注工具'),
                 subtitle: const Text('版本 1.0.0'),
+              ),
+            ),
+            const SizedBox(height: 12),
+            Card(
+              child: ListTile(
+                leading: Icon(
+                  Icons.volume_up,
+                  color: theme.colorScheme.primary,
+                ),
+                title: const Text('音量键快速标记'),
+                subtitle: const Text('计时运行时：音量+ → 亮点，音量- → 不足'),
               ),
             ),
           ],
@@ -2591,55 +2695,3 @@ class _ClipItem extends StatelessWidget {
   }
 }
 
-// ==================== Bottom Actions ====================
-
-class _BottomActionsSection extends StatelessWidget {
-  @override
-  Widget build(BuildContext context) {
-    final state = context.watch<AppState>();
-
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
-      child: Row(
-        children: [
-          Expanded(
-            child: OutlinedButton.icon(
-              onPressed: state.clips.isEmpty ? null : state.reset,
-              icon: const Icon(Icons.refresh),
-              label: const Text('重置'),
-            ),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: FilledButton.icon(
-              onPressed: state.clips.isEmpty
-                  ? null
-                  : () => _shareTxt(context, state),
-              icon: const Icon(Icons.share),
-              label: const Text('导出 TXT'),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Future<void> _shareTxt(BuildContext context, AppState state) async {
-    final content = state.generateTxt();
-    try {
-      final dir = await getTemporaryDirectory();
-      final fileName =
-          'video_clips_${DateTime.now().millisecondsSinceEpoch}.txt';
-      final file = File('${dir.path}/$fileName');
-      await file.writeAsString(content);
-
-      await Share.shareXFiles([XFile(file.path)], subject: '视频标注片段');
-    } catch (e) {
-      if (context.mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('导出失败: $e')));
-      }
-    }
-  }
-}
