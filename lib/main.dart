@@ -491,6 +491,53 @@ class WhisperService {
   }
 }
 
+// ==================== Bluetooth HID Service ====================
+
+/// Wraps the native BLE HID peripheral channel so the rest of the Dart code
+/// stays platform-agnostic.
+class BluetoothHidService {
+  static const _channel = MethodChannel('video_annotator/bluetooth_hid');
+
+  static Future<bool> isSupported() async {
+    try {
+      final result = await _channel.invokeMethod<bool>('isSupported');
+      return result ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<void> startAdvertising() =>
+      _channel.invokeMethod('startAdvertising');
+
+  static Future<void> stopAdvertising() =>
+      _channel.invokeMethod('stopAdvertising');
+
+  static Future<void> sendVolumeUp() =>
+      _channel.invokeMethod('sendVolumeUp');
+
+  static Future<void> sendVolumeDown() =>
+      _channel.invokeMethod('sendVolumeDown');
+
+  static Future<bool> getConnectionStatus() async {
+    try {
+      final result = await _channel.invokeMethod<bool>('getConnectionStatus');
+      return result ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Subscribe to native connection-change events.
+  static void setConnectionListener(void Function(bool connected) listener) {
+    _channel.setMethodCallHandler((call) async {
+      if (call.method == 'onConnectionChanged') {
+        listener(call.arguments as bool? ?? false);
+      }
+    });
+  }
+}
+
 // ==================== State ====================
 
 // MethodChannel for volume button events from native Android
@@ -543,6 +590,12 @@ class AppState extends ChangeNotifier {
   // Navigation state
   int _selectedIndex = 0;
 
+  // Bluetooth HID peripheral state
+  bool _btHidSupported = false;
+  bool _btHidAdvertising = false;
+  bool _btHidConnected = false;
+  bool _btHidEnabled = false; // user has toggled BT remote on
+
   // Getters
   bool get isRunning => _isRunning;
   int get elapsedMs => _elapsedMs;
@@ -567,6 +620,10 @@ class AppState extends ChangeNotifier {
       (_apiEndpoint?.trim().isNotEmpty ?? false);
   bool get isModelAvailable => _isModelDownloaded || isApiConfigured;
   String? get transcribingClipId => _transcribingClipId;
+  bool get btHidSupported => _btHidSupported;
+  bool get btHidAdvertising => _btHidAdvertising;
+  bool get btHidConnected => _btHidConnected;
+  bool get btHidEnabled => _btHidEnabled;
 
   String get formattedTime {
     final totalSeconds = _elapsedMs ~/ 1000;
@@ -592,7 +649,42 @@ class AppState extends ChangeNotifier {
   Future<void> checkModelStatus() async {
     _isModelDownloaded = await WhisperService.isModelDownloaded(_selectedModelSize);
     await ensureStoragePermission();
+    _btHidSupported = await BluetoothHidService.isSupported();
     notifyListeners();
+  }
+
+  // ---- Bluetooth HID peripheral -----------------------------------------
+
+  Future<void> initBluetoothHid() async {
+    _btHidSupported = await BluetoothHidService.isSupported();
+    BluetoothHidService.setConnectionListener((connected) {
+      _btHidConnected = connected;
+      notifyListeners();
+    });
+    notifyListeners();
+  }
+
+  Future<void> toggleBluetoothHid() async {
+    if (!_btHidSupported) return;
+    if (_btHidAdvertising) {
+      await BluetoothHidService.stopAdvertising();
+      _btHidAdvertising = false;
+      _btHidConnected = false;
+      _btHidEnabled = false;
+    } else {
+      await BluetoothHidService.startAdvertising();
+      _btHidAdvertising = true;
+      _btHidEnabled = true;
+    }
+    notifyListeners();
+  }
+
+  Future<void> _sendBluetoothVolumeUp() async {
+    if (_btHidEnabled && _btHidConnected) {
+      try {
+        await BluetoothHidService.sendVolumeUp();
+      } catch (_) {}
+    }
   }
 
   Future<void> loadSettings() async {
@@ -763,6 +855,9 @@ class AppState extends ChangeNotifier {
       notifyListeners();
     });
     notifyListeners();
+
+    // Trigger iPhone camera start via BLE HID Volume Up
+    await _sendBluetoothVolumeUp();
   }
 
   void stop() async {
@@ -771,6 +866,9 @@ class AppState extends ChangeNotifier {
     WakelockPlus.disable();
     _timer?.cancel();
     _timer = null;
+
+    // Trigger iPhone camera stop via BLE HID Volume Up (same key stops recording)
+    await _sendBluetoothVolumeUp();
 
     // Auto-save project when stopping
     if (_currentProjectPath != null && _clips.isNotEmpty) {
@@ -1083,6 +1181,7 @@ class VideoAnnotatorApp extends StatelessWidget {
         final state = AppState();
         state.loadSettings().then((_) => state.checkModelStatus());
         state.setupVolumeButtons();
+        state.initBluetoothHid();
         return state;
       },
       child: MaterialApp(
@@ -1286,6 +1385,19 @@ class _ProjectHeader extends StatelessWidget {
                 ),
               ),
               const Spacer(),
+              // BT HID connection status indicator
+              if (state.btHidEnabled)
+                Tooltip(
+                  message: state.btHidConnected ? '已连接 iPhone' : '等待配对…',
+                  child: Icon(
+                    Icons.bluetooth,
+                    size: 20,
+                    color: state.btHidConnected
+                        ? const Color(0xFF1565C0)
+                        : Colors.orange,
+                  ),
+                ),
+              if (state.btHidEnabled) const SizedBox(width: 8),
               Text(
                 '${state.clips.length} 个片段',
                 style: theme.textTheme.bodyMedium?.copyWith(
@@ -1925,6 +2037,94 @@ class _SettingsPageState extends State<_SettingsPage> {
                         state.setWindowSeconds(v.round());
                       },
                     ),
+                  ],
+                ),
+              ),
+            ),
+
+            const SizedBox(height: 24),
+
+            // Bluetooth Remote section
+            Text(
+              '蓝牙遥控 (触发 iPhone 录制)',
+              style: theme.textTheme.titleSmall?.copyWith(
+                color: theme.colorScheme.primary,
+              ),
+            ),
+            const SizedBox(height: 12),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    if (!state.btHidSupported)
+                      const ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        leading: Icon(Icons.bluetooth_disabled, color: Colors.grey),
+                        title: Text('此设备不支持 BLE HID 外设模式'),
+                        subtitle: Text('需要 Android 9+ 或 iOS/iPadOS 设备'),
+                      )
+                    else ...[
+                      Row(
+                        children: [
+                          Icon(
+                            state.btHidConnected
+                                ? Icons.bluetooth_connected
+                                : state.btHidAdvertising
+                                ? Icons.bluetooth_searching
+                                : Icons.bluetooth,
+                            color: state.btHidConnected
+                                ? const Color(0xFF1565C0)
+                                : state.btHidAdvertising
+                                ? Colors.orange
+                                : theme.colorScheme.onSurfaceVariant,
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Text(
+                              state.btHidConnected
+                                  ? '已连接 iPhone ✓'
+                                  : state.btHidAdvertising
+                                  ? '广播中，请在 iPhone 蓝牙设置中配对'
+                                  : '未开启',
+                              style: TextStyle(
+                                color: state.btHidConnected
+                                    ? const Color(0xFF1565C0)
+                                    : state.btHidAdvertising
+                                    ? Colors.orange
+                                    : theme.colorScheme.onSurfaceVariant,
+                                fontWeight: FontWeight.w500,
+                              ),
+                            ),
+                          ),
+                          Switch(
+                            value: state.btHidAdvertising,
+                            onChanged: (_) => state.toggleBluetoothHid(),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      Container(
+                        padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(
+                          color: theme.colorScheme.surfaceContainerHighest.withAlpha(80),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: const Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text('操作流程：', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                            SizedBox(height: 4),
+                            Text('1. 开启广播（拨动开关）', style: TextStyle(fontSize: 12)),
+                            Text('2. iPhone 蓝牙设置中找到 "Video Annotator" 并配对（仅首次）', style: TextStyle(fontSize: 12)),
+                            Text('3. iPhone 打开相机并切换到视频模式', style: TextStyle(fontSize: 12)),
+                            Text('4. 本 App 点击开始计时 → iPhone 自动开始录制', style: TextStyle(fontSize: 12)),
+                            Text('5. 点击停止计时 → iPhone 自动停止录制', style: TextStyle(fontSize: 12)),
+                          ],
+                        ),
+                      ),
+                    ],
                   ],
                 ),
               ),
