@@ -1631,8 +1631,8 @@ class _SettingsPage extends StatefulWidget {
 }
 
 class _SettingsPageState extends State<_SettingsPage> {
-  TextEditingController _apiKeyController = TextEditingController();
-  TextEditingController _apiEndpointController = TextEditingController();
+  late final TextEditingController _apiKeyController;
+  late final TextEditingController _apiEndpointController;
 
   bool _initialized = false;
 
