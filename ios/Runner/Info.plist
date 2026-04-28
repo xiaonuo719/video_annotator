@@ -2,6 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>本 App 需要蓝牙权限，以便将设备模拟为蓝牙 HID 遥控器，在计时开始/结束时自动触发 iPhone 相机录制。</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>本 App 需要蓝牙权限，以便将设备模拟为蓝牙 HID 遥控器，在计时开始/结束时自动触发 iPhone 相机录制。</string>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
 	<key>CFBundleDevelopmentRegion</key>

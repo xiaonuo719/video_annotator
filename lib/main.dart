@@ -2,12 +2,14 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
 import 'package:record/record.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:whisper_flutter_new/whisper_flutter_new.dart';
 import 'package:uuid/uuid.dart';
@@ -489,7 +491,64 @@ class WhisperService {
   }
 }
 
+// ==================== Bluetooth HID Service ====================
+
+/// Wraps the native BLE HID peripheral channel so the rest of the Dart code
+/// stays platform-agnostic.
+class BluetoothHidService {
+  static const _channel = MethodChannel('video_annotator/bluetooth_hid');
+
+  static Future<bool> isSupported() async {
+    try {
+      final result = await _channel.invokeMethod<bool>('isSupported');
+      return result ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<void> startAdvertising() =>
+      _channel.invokeMethod('startAdvertising');
+
+  static Future<void> stopAdvertising() =>
+      _channel.invokeMethod('stopAdvertising');
+
+  static Future<void> sendVolumeUp() =>
+      _channel.invokeMethod('sendVolumeUp');
+
+  static Future<void> sendVolumeDown() =>
+      _channel.invokeMethod('sendVolumeDown');
+
+  static Future<bool> getConnectionStatus() async {
+    try {
+      final result = await _channel.invokeMethod<bool>('getConnectionStatus');
+      return result ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Subscribe to native connection-change events.
+  static void setConnectionListener(void Function(bool connected) listener) {
+    _channel.setMethodCallHandler((call) async {
+      if (call.method == 'onConnectionChanged') {
+        listener(call.arguments as bool? ?? false);
+      }
+    });
+  }
+}
+
 // ==================== State ====================
+
+// MethodChannel for volume button events from native Android
+const _volumeChannel = MethodChannel('video_annotator/volume_buttons');
+
+// SharedPreferences keys
+const _prefWindowSeconds = 'window_seconds';
+const _prefModelSize = 'model_size';
+const _prefUseApiMode = 'use_api_mode';
+const _prefApiKey = 'api_key';
+const _prefApiEndpoint = 'api_endpoint';
 
 class AppState extends ChangeNotifier {
   bool _isRunning = false;
@@ -522,6 +581,7 @@ class AppState extends ChangeNotifier {
 
   // Project state
   String? _currentProjectPath;
+  DateTime? _projectCreatedAt;
   bool _isDirty = false;
 
   // Transcription state
@@ -529,6 +589,12 @@ class AppState extends ChangeNotifier {
 
   // Navigation state
   int _selectedIndex = 0;
+
+  // Bluetooth HID peripheral state
+  bool _btHidSupported = false;
+  bool _btHidAdvertising = false;
+  bool _btHidConnected = false;
+  bool _btHidEnabled = false; // user has toggled BT remote on
 
   // Getters
   bool get isRunning => _isRunning;
@@ -554,6 +620,10 @@ class AppState extends ChangeNotifier {
       (_apiEndpoint?.trim().isNotEmpty ?? false);
   bool get isModelAvailable => _isModelDownloaded || isApiConfigured;
   String? get transcribingClipId => _transcribingClipId;
+  bool get btHidSupported => _btHidSupported;
+  bool get btHidAdvertising => _btHidAdvertising;
+  bool get btHidConnected => _btHidConnected;
+  bool get btHidEnabled => _btHidEnabled;
 
   String get formattedTime {
     final totalSeconds = _elapsedMs ~/ 1000;
@@ -580,6 +650,86 @@ class AppState extends ChangeNotifier {
     _isModelDownloaded = await WhisperService.isModelDownloaded(_selectedModelSize);
     await ensureStoragePermission();
     notifyListeners();
+  }
+
+  // ---- Bluetooth HID peripheral -----------------------------------------
+
+  Future<void> initBluetoothHid() async {
+    _btHidSupported = await BluetoothHidService.isSupported();
+    BluetoothHidService.setConnectionListener((connected) {
+      _btHidConnected = connected;
+      notifyListeners();
+    });
+    notifyListeners();
+  }
+
+  Future<void> toggleBluetoothHid() async {
+    if (!_btHidSupported) return;
+    if (_btHidAdvertising) {
+      await BluetoothHidService.stopAdvertising();
+      _btHidAdvertising = false;
+      _btHidConnected = false;
+      _btHidEnabled = false;
+    } else {
+      await BluetoothHidService.startAdvertising();
+      _btHidAdvertising = true;
+      _btHidEnabled = true;
+    }
+    notifyListeners();
+  }
+
+  Future<void> _sendBluetoothVolumeUp() async {
+    if (_btHidEnabled && _btHidConnected) {
+      try {
+        await BluetoothHidService.sendVolumeUp();
+      } catch (e) {
+        debugPrint('BluetoothHidService.sendVolumeUp failed: $e');
+      }
+    }
+  }
+
+  Future<void> loadSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    _windowSeconds = prefs.getInt(_prefWindowSeconds) ?? 30;
+    final modelIndex = prefs.getInt(_prefModelSize) ?? WhisperModelSize.base.index;
+    _selectedModelSize = WhisperModelSize.values[modelIndex.clamp(0, WhisperModelSize.values.length - 1)];
+    _useApiMode = prefs.getBool(_prefUseApiMode) ?? false;
+    _apiKey = prefs.getString(_prefApiKey);
+    _apiEndpoint = prefs.getString(_prefApiEndpoint);
+    notifyListeners();
+  }
+
+  Future<void> _saveSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_prefWindowSeconds, _windowSeconds);
+    await prefs.setInt(_prefModelSize, _selectedModelSize.index);
+    await prefs.setBool(_prefUseApiMode, _useApiMode);
+    if (_apiKey != null) {
+      await prefs.setString(_prefApiKey, _apiKey!);
+    } else {
+      await prefs.remove(_prefApiKey);
+    }
+    if (_apiEndpoint != null) {
+      await prefs.setString(_prefApiEndpoint, _apiEndpoint!);
+    } else {
+      await prefs.remove(_prefApiEndpoint);
+    }
+  }
+
+  void setupVolumeButtons() {
+    _volumeChannel.setMethodCallHandler((call) async {
+      // Ignore volume events when the session is not active or a recording is
+      // already in progress to prevent accidental duplicate marks.
+      if (!_isRunning || _isRecording) return;
+      switch (call.method) {
+        case 'volumeUp':
+          onMarkButtonPressed('亮点');
+          break;
+        case 'volumeDown':
+          onMarkButtonPressed('不足');
+          break;
+      }
+    });
   }
 
   Future<void> downloadModel() async {
@@ -616,26 +766,31 @@ class AppState extends ChangeNotifier {
   void setSelectedModelSize(WhisperModelSize size) {
     if (_selectedModelSize == size) return;
     _selectedModelSize = size;
+    _saveSettings();
     checkModelStatus();
   }
 
   void setUseApiMode(bool value) {
     _useApiMode = value;
+    _saveSettings();
     notifyListeners();
   }
 
   void setApiKey(String? value) {
     _apiKey = value?.trim();
+    _saveSettings();
     notifyListeners();
   }
 
   void setApiEndpoint(String? value) {
     _apiEndpoint = value?.trim();
+    _saveSettings();
     notifyListeners();
   }
 
   void setWindowSeconds(int seconds) {
     _windowSeconds = seconds.clamp(5, 120);
+    _saveSettings();
     notifyListeners();
   }
 
@@ -701,6 +856,9 @@ class AppState extends ChangeNotifier {
       notifyListeners();
     });
     notifyListeners();
+
+    // Trigger iPhone camera start via BLE HID Volume Up
+    await _sendBluetoothVolumeUp();
   }
 
   void stop() async {
@@ -709,6 +867,9 @@ class AppState extends ChangeNotifier {
     WakelockPlus.disable();
     _timer?.cancel();
     _timer = null;
+
+    // Trigger iPhone camera stop via BLE HID Volume Up (same key stops recording)
+    await _sendBluetoothVolumeUp();
 
     // Auto-save project when stopping
     if (_currentProjectPath != null && _clips.isNotEmpty) {
@@ -918,7 +1079,7 @@ class AppState extends ChangeNotifier {
     if (_currentProjectPath == null) return;
     final project = Project(
       name: projectName,
-      createdAt: DateTime.now(),
+      createdAt: _projectCreatedAt ?? DateTime.now(),
       updatedAt: DateTime.now(),
       clips: _clips,
     );
@@ -953,6 +1114,7 @@ class AppState extends ChangeNotifier {
   Future<void> newProject() async {
     final projectPath = await ProjectService.generateProjectPath();
     _currentProjectPath = projectPath;
+    _projectCreatedAt = DateTime.now();
     _isDirty = false;
     reset();
     notifyListeners();
@@ -963,6 +1125,7 @@ class AppState extends ChangeNotifier {
     if (project == null) return;
 
     _currentProjectPath = projectPath;
+    _projectCreatedAt = project.createdAt;
     _clips.clear();
     _clips.addAll(project.clips);
 
@@ -992,6 +1155,7 @@ class AppState extends ChangeNotifier {
     if (_currentProjectPath != null) {
       await ProjectService.deleteProject(_currentProjectPath!);
       _currentProjectPath = null;
+      _projectCreatedAt = null;
       reset();
       notifyListeners();
     }
@@ -1014,7 +1178,13 @@ class VideoAnnotatorApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return ChangeNotifierProvider(
-      create: (_) => AppState()..checkModelStatus(),
+      create: (_) {
+        final state = AppState();
+        state.loadSettings().then((_) => state.checkModelStatus());
+        state.setupVolumeButtons();
+        state.initBluetoothHid();
+        return state;
+      },
       child: MaterialApp(
         title: '视频标注工具',
         debugShowCheckedModeBanner: false,
@@ -1216,6 +1386,19 @@ class _ProjectHeader extends StatelessWidget {
                 ),
               ),
               const Spacer(),
+              // BT HID connection status indicator
+              if (state.btHidEnabled)
+                Tooltip(
+                  message: state.btHidConnected ? '已连接 iPhone' : '等待配对…',
+                  child: Icon(
+                    Icons.bluetooth,
+                    size: 20,
+                    color: state.btHidConnected
+                        ? const Color(0xFF1565C0)
+                        : Colors.orange,
+                  ),
+                ),
+              if (state.btHidEnabled) const SizedBox(width: 8),
               Text(
                 '${state.clips.length} 个片段',
                 style: theme.textTheme.bodyMedium?.copyWith(
@@ -1553,8 +1736,36 @@ class _ModeChip extends StatelessWidget {
 
 // ==================== Settings Page ====================
 
-class _SettingsPage extends StatelessWidget {
+class _SettingsPage extends StatefulWidget {
   const _SettingsPage();
+
+  @override
+  State<_SettingsPage> createState() => _SettingsPageState();
+}
+
+class _SettingsPageState extends State<_SettingsPage> {
+  late final TextEditingController _apiKeyController;
+  late final TextEditingController _apiEndpointController;
+
+  bool _initialized = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (!_initialized) {
+      _initialized = true;
+      final state = Provider.of<AppState>(context, listen: false);
+      _apiKeyController = TextEditingController(text: state.apiKey ?? '');
+      _apiEndpointController = TextEditingController(text: state.apiEndpoint ?? '');
+    }
+  }
+
+  @override
+  void dispose() {
+    _apiKeyController.dispose();
+    _apiEndpointController.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1737,6 +1948,7 @@ class _SettingsPage extends StatelessWidget {
                     ] else ...[
                       // API configuration
                       TextField(
+                        controller: _apiKeyController,
                         decoration: const InputDecoration(
                           labelText: 'API Key',
                           hintText: 'sk-...',
@@ -1747,6 +1959,7 @@ class _SettingsPage extends StatelessWidget {
                       ),
                       const SizedBox(height: 12),
                       TextField(
+                        controller: _apiEndpointController,
                         decoration: const InputDecoration(
                           labelText: 'API Endpoint',
                           hintText: 'https://api.openai.com/v1/audio/transcriptions',
@@ -1832,6 +2045,94 @@ class _SettingsPage extends StatelessWidget {
 
             const SizedBox(height: 24),
 
+            // Bluetooth Remote section
+            Text(
+              '蓝牙遥控 (触发 iPhone 录制)',
+              style: theme.textTheme.titleSmall?.copyWith(
+                color: theme.colorScheme.primary,
+              ),
+            ),
+            const SizedBox(height: 12),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    if (!state.btHidSupported)
+                      const ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        leading: Icon(Icons.bluetooth_disabled, color: Colors.grey),
+                        title: Text('此设备不支持 BLE HID 外设模式'),
+                        subtitle: Text('需要 Android 9+ 或 iOS/iPadOS 设备'),
+                      )
+                    else ...[
+                      Row(
+                        children: [
+                          Icon(
+                            state.btHidConnected
+                                ? Icons.bluetooth_connected
+                                : state.btHidAdvertising
+                                ? Icons.bluetooth_searching
+                                : Icons.bluetooth,
+                            color: state.btHidConnected
+                                ? const Color(0xFF1565C0)
+                                : state.btHidAdvertising
+                                ? Colors.orange
+                                : theme.colorScheme.onSurfaceVariant,
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Text(
+                              state.btHidConnected
+                                  ? '已连接 iPhone ✓'
+                                  : state.btHidAdvertising
+                                  ? '广播中，请在 iPhone 蓝牙设置中配对'
+                                  : '未开启',
+                              style: TextStyle(
+                                color: state.btHidConnected
+                                    ? const Color(0xFF1565C0)
+                                    : state.btHidAdvertising
+                                    ? Colors.orange
+                                    : theme.colorScheme.onSurfaceVariant,
+                                fontWeight: FontWeight.w500,
+                              ),
+                            ),
+                          ),
+                          Switch(
+                            value: state.btHidAdvertising,
+                            onChanged: (_) => state.toggleBluetoothHid(),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      Container(
+                        padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(
+                          color: theme.colorScheme.surfaceContainerHighest.withAlpha(80),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: const Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text('操作流程：', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                            SizedBox(height: 4),
+                            Text('1. 开启广播（拨动开关）', style: TextStyle(fontSize: 12)),
+                            Text('2. iPhone 蓝牙设置中找到 "Video Annotator" 并配对（仅首次）', style: TextStyle(fontSize: 12)),
+                            Text('3. iPhone 打开相机并切换到视频模式', style: TextStyle(fontSize: 12)),
+                            Text('4. 本 App 点击开始计时 → iPhone 自动开始录制', style: TextStyle(fontSize: 12)),
+                            Text('5. 点击停止计时 → iPhone 自动停止录制', style: TextStyle(fontSize: 12)),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+
+            const SizedBox(height: 24),
+
             // About section
             Text(
               '关于',
@@ -1845,6 +2146,17 @@ class _SettingsPage extends StatelessWidget {
                 leading: const Icon(Icons.info_outline),
                 title: const Text('视频标注工具'),
                 subtitle: const Text('版本 1.0.0'),
+              ),
+            ),
+            const SizedBox(height: 12),
+            Card(
+              child: ListTile(
+                leading: Icon(
+                  Icons.volume_up,
+                  color: theme.colorScheme.primary,
+                ),
+                title: const Text('音量键快速标记'),
+                subtitle: const Text('计时运行时：音量+ → 亮点，音量- → 不足'),
               ),
             ),
           ],
@@ -2591,55 +2903,3 @@ class _ClipItem extends StatelessWidget {
   }
 }
 
-// ==================== Bottom Actions ====================
-
-class _BottomActionsSection extends StatelessWidget {
-  @override
-  Widget build(BuildContext context) {
-    final state = context.watch<AppState>();
-
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
-      child: Row(
-        children: [
-          Expanded(
-            child: OutlinedButton.icon(
-              onPressed: state.clips.isEmpty ? null : state.reset,
-              icon: const Icon(Icons.refresh),
-              label: const Text('重置'),
-            ),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: FilledButton.icon(
-              onPressed: state.clips.isEmpty
-                  ? null
-                  : () => _shareTxt(context, state),
-              icon: const Icon(Icons.share),
-              label: const Text('导出 TXT'),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Future<void> _shareTxt(BuildContext context, AppState state) async {
-    final content = state.generateTxt();
-    try {
-      final dir = await getTemporaryDirectory();
-      final fileName =
-          'video_clips_${DateTime.now().millisecondsSinceEpoch}.txt';
-      final file = File('${dir.path}/$fileName');
-      await file.writeAsString(content);
-
-      await Share.shareXFiles([XFile(file.path)], subject: '视频标注片段');
-    } catch (e) {
-      if (context.mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('导出失败: $e')));
-      }
-    }
-  }
-}
